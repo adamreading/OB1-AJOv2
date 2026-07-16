@@ -1,0 +1,495 @@
+"use client";
+
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  DndContext,
+  DragOverlay,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragOverEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
+import { arrayMove } from "@dnd-kit/sortable";
+import type { Thought } from "@/lib/types";
+import { KANBAN_STATUSES, KANBAN_TYPES } from "@/lib/types";
+import { KanbanColumn } from "@/components/KanbanColumn";
+import { KanbanCard } from "@/components/KanbanCard";
+import { KanbanCardModal } from "@/components/KanbanCardModal";
+
+const AUTO_ARCHIVE_DAYS = 30;
+
+async function apiUpdateKanban(
+  thoughtId: number,
+  updates: Record<string, unknown>
+): Promise<void> {
+  const res = await fetch("/api/kanban/update", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thoughtId, ...updates }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || "Update failed");
+  }
+}
+
+export type KanbanAction = {
+  thought_serial_id: number;
+  action: string;
+  type: string;
+  created_at: string;
+};
+
+export function KanbanBoard() {
+  const [thoughts, setThoughts] = useState<Thought[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [contextFilter, setContextFilter] = useState<"all" | "work" | "personal">("all");
+  const [selectedThought, setSelectedThought] = useState<Thought | null>(null);
+  const [activeDragThought, setActiveDragThought] = useState<Thought | null>(null);
+  // entity-name (lowercase) → list of pending actions from linked source thoughts
+  const [actionsByEntity, setActionsByEntity] = useState<Map<string, KanbanAction[]>>(new Map());
+  const previousThoughts = useRef<Thought[]>([]);
+  const originalStatus = useRef<string | null>(null);
+  const finalStatus = useRef<string | null>(null);
+
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 10 } })
+  );
+
+  const fetchData = useCallback(async () => {
+    try {
+      setError(null);
+      const [kanbanRes, actionsRes] = await Promise.all([
+        fetch(`/api/kanban${showArchived ? "?archived=true" : ""}`),
+        // Last 30 days, with linked entities so we can attach actions to kanban cards.
+        fetch(`/api/actions?with_entities=true&since_hours=720&limit=500`),
+      ]);
+      if (!kanbanRes.ok) throw new Error("Failed to load kanban data");
+      const kanbanData = await kanbanRes.json();
+      setThoughts(kanbanData.thoughts || []);
+
+      if (actionsRes.ok) {
+        const actionsData = await actionsRes.json();
+        const map = new Map<string, KanbanAction[]>();
+        for (const t of actionsData.thoughts || []) {
+          const items: string[] = Array.isArray(t.metadata?.action_items) ? t.metadata.action_items : [];
+          const entities: Array<{ canonical_name: string; aliases?: string[] }> = t.linked_entities || [];
+          if (entities.length === 0) continue;
+          for (const item of items) {
+            const action: KanbanAction = {
+              thought_serial_id: t.serial_id,
+              action: String(item),
+              type: t.type,
+              created_at: t.created_at,
+            };
+            for (const e of entities) {
+              const keys = [e.canonical_name, ...(e.aliases || [])].map((s) => String(s).toLowerCase().trim());
+              for (const k of keys) {
+                if (!k) continue;
+                if (!map.has(k)) map.set(k, []);
+                map.get(k)!.push(action);
+              }
+            }
+          }
+        }
+        setActionsByEntity(map);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [showArchived]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  // Group thoughts by status, with auto-archive for old done items
+  function groupByStatus(): Record<string, Thought[]> {
+    const groups: Record<string, Thought[]> = {};
+    for (const s of KANBAN_STATUSES) groups[s] = [];
+    if (showArchived) groups["archived"] = [];
+
+    for (const t of thoughts) {
+      // Apply Context Filter
+      if (contextFilter !== "all") {
+        const tContext = (t.metadata?.classification as string) || "personal";
+        if (tContext !== contextFilter) continue;
+      }
+
+      const thoughtStatus = t.status ?? "new";
+
+      // Auto-archive: done items older than 30 days
+      if (
+        thoughtStatus === "done" &&
+        t.status_updated_at &&
+        Date.now() - new Date(t.status_updated_at).getTime() >
+          AUTO_ARCHIVE_DAYS * 24 * 60 * 60 * 1000
+      ) {
+        if (showArchived) groups["archived"].push(t);
+        continue;
+      }
+
+      if (thoughtStatus === "archived") {
+        if (showArchived) groups["archived"].push(t);
+        continue;
+      }
+
+      if (groups[thoughtStatus]) {
+        groups[thoughtStatus].push(t);
+      } else {
+        groups["backlog"].push(t);
+      }
+    }
+    return groups;
+  }
+
+  function handleDragStart(event: DragStartEvent) {
+    const thought = thoughts.find((t) => t.id === event.active.id);
+    setActiveDragThought(thought ?? null);
+    originalStatus.current = thought?.status ?? null;
+    finalStatus.current = thought?.status ?? null;
+  }
+
+  function handleDragOver(event: DragOverEvent) {
+    const { active, over } = event;
+    if (!over) return;
+
+    const activeId = active.id as number;
+    const overId = over.id;
+    const validStatuses: string[] = [...KANBAN_STATUSES, "archived"];
+
+    setThoughts((prev) => {
+      const activeIndex = prev.findIndex((t) => t.id === activeId);
+      if (activeIndex === -1) return prev;
+      const activeThought = prev[activeIndex];
+      const currentStatus = activeThought.status ?? "backlog";
+
+      if (typeof overId === "string" && validStatuses.includes(overId)) {
+        // Hovering directly over a column (empty space)
+        if (currentStatus === overId) return prev;
+        finalStatus.current = overId;
+        return prev.map((t) => t.id === activeId ? { ...t, status: overId } : t);
+      }
+
+      // Hovering over a card
+      const overCardId = overId as number;
+      if (activeId === overCardId) return prev;
+      const overIndex = prev.findIndex((t) => t.id === overCardId);
+      if (overIndex === -1) return prev;
+      const overThought = prev[overIndex];
+      const overStatus = overThought.status ?? "backlog";
+
+      if (currentStatus === overStatus) {
+        // Same column: reorder in place
+        return arrayMove(prev, activeIndex, overIndex);
+      }
+
+      // Different column: update status and move to position
+      finalStatus.current = overStatus;
+      const withStatus = prev.map((t) =>
+        t.id === activeId ? { ...t, status: overStatus } : t
+      );
+      const newActiveIndex = withStatus.findIndex((t) => t.id === activeId);
+      return arrayMove(withStatus, newActiveIndex, overIndex);
+    });
+  }
+
+  function handleDragEnd(event: DragEndEvent) {
+    setActiveDragThought(null);
+    const { active } = event;
+    const thoughtId = active.id as number;
+    const orig = originalStatus.current;
+    const final = finalStatus.current;
+    originalStatus.current = null;
+    finalStatus.current = null;
+
+    if (!orig || !final || orig === final) return;
+
+    // Persist status change to API
+    apiUpdateKanban(thoughtId, { status: final }).catch(() => {
+      setThoughts((prev) =>
+        prev.map((t) => t.id === thoughtId ? { ...t, status: orig } : t)
+      );
+      setError("Failed to update status. Reverted.");
+      setTimeout(() => setError(null), 5000);
+    });
+  }
+
+  async function handlePriorityChange(thoughtId: number, newImportance: number) {
+    previousThoughts.current = [...thoughts];
+    setThoughts((prev) =>
+      prev.map((t) =>
+        t.id === thoughtId ? { ...t, importance: newImportance } : t
+      )
+    );
+
+    try {
+      await apiUpdateKanban(thoughtId, { importance: newImportance });
+    } catch {
+      setThoughts(previousThoughts.current);
+      setError("Failed to update priority. Reverted.");
+      setTimeout(() => setError(null), 5000);
+    }
+  }
+
+  async function handleArchive(thoughtId: number) {
+    previousThoughts.current = [...thoughts];
+    setThoughts((prev) =>
+      prev.map((t) =>
+        t.id === thoughtId
+          ? { ...t, status: "archived", status_updated_at: new Date().toISOString() }
+          : t
+      )
+    );
+
+    try {
+      await apiUpdateKanban(thoughtId, { status: "archived" });
+    } catch {
+      setThoughts(previousThoughts.current);
+      setError("Failed to archive. Reverted.");
+      setTimeout(() => setError(null), 5000);
+    }
+  }
+
+  async function handleDelete(thoughtId: number) {
+    previousThoughts.current = [...thoughts];
+    setThoughts((prev) => prev.filter((t) => t.id !== thoughtId));
+
+    try {
+      const res = await fetch("/api/kanban/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thoughtId }),
+      });
+      if (!res.ok) throw new Error("Delete failed");
+    } catch {
+      setThoughts(previousThoughts.current);
+      setError("Failed to delete. Reverted.");
+      setTimeout(() => setError(null), 5000);
+    }
+  }
+
+  async function handleModalSave(
+    thoughtId: number,
+    updates: Record<string, unknown>
+  ) {
+    previousThoughts.current = [...thoughts];
+
+    // If type changed to non-kanban, remove from board entirely
+    const isLeavingKanban =
+      typeof updates.type === "string" && !KANBAN_TYPES.includes(updates.type);
+
+    if (isLeavingKanban) {
+      setThoughts((prev) => prev.filter((t) => t.id !== thoughtId));
+    } else {
+      setThoughts((prev) =>
+        prev.map((t) => {
+          if (t.id !== thoughtId) return t;
+          const updated = { ...t, ...updates };
+          if (updates.status) updated.status_updated_at = new Date().toISOString();
+          return updated as Thought;
+        })
+      );
+    }
+
+    try {
+      await apiUpdateKanban(thoughtId, updates);
+    } catch {
+      setThoughts(previousThoughts.current);
+      setError("Failed to save changes. Reverted.");
+      setTimeout(() => setError(null), 5000);
+    }
+  }
+
+  // Loading skeleton
+  if (isLoading) {
+    return (
+      <div className="flex gap-3">
+        {KANBAN_STATUSES.map((s) => (
+          <div
+            key={s}
+            className="flex-1 min-w-0 rounded-lg border border-border bg-bg-primary"
+          >
+            <div className="px-3 py-2.5 border-b border-border">
+              <div className="h-4 w-20 bg-bg-hover rounded animate-pulse" />
+            </div>
+            <div className="p-2 space-y-2">
+              {[1, 2, 3].map((i) => (
+                <div
+                  key={i}
+                  className="h-20 bg-bg-hover rounded-lg animate-pulse"
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  const grouped = groupByStatus();
+  const columns = showArchived
+    ? [...KANBAN_STATUSES, "archived" as const]
+    : [...KANBAN_STATUSES];
+
+  return (
+    <>
+      {/* Error banner */}
+      {error && (
+        <div className="mb-4 px-4 py-2 bg-danger/10 border border-danger/30 rounded-lg text-sm text-danger">
+          {error}
+        </div>
+      )}
+
+      {/* Controls */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 16,
+          marginBottom: 18,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 16,
+            flexWrap: "wrap",
+          }}
+        >
+          <div
+            style={{
+              display: "inline-flex",
+              padding: 3,
+              gap: 2,
+              background: "var(--bg-3)",
+              border: "1px solid var(--line)",
+              borderRadius: 8,
+            }}
+          >
+            {(["all", "work", "personal"] as const).map((ctx) => {
+              const isActive = contextFilter === ctx;
+              return (
+                <button
+                  key={ctx}
+                  type="button"
+                  onClick={() => setContextFilter(ctx)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    fontSize: 12,
+                    color: isActive ? "var(--fg)" : "var(--fg-3)",
+                    background: isActive
+                      ? "rgba(130,97,255,0.18)"
+                      : "transparent",
+                    border: isActive
+                      ? "1px solid rgba(157,131,255,0.25)"
+                      : "1px solid transparent",
+                    fontWeight: isActive ? 500 : 400,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  {ctx.charAt(0).toUpperCase() + ctx.slice(1)}
+                </button>
+              );
+            })}
+          </div>
+
+          <span
+            style={{ width: 1, height: 24, background: "var(--line)" }}
+          />
+
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              fontSize: 12,
+              color: "var(--fg-3)",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+              style={{ accentColor: "var(--violet-400)" }}
+            />
+            Show archived
+          </label>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            setIsLoading(true);
+            fetchData();
+          }}
+          style={{
+            padding: "7px 12px",
+            borderRadius: 8,
+            border: "1px solid var(--line-strong)",
+            background: "var(--bg-2)",
+            color: "var(--fg-2)",
+            fontSize: 12,
+            cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >
+          ↻ Refresh
+        </button>
+      </div>
+
+      {/* Board */}
+      <DndContext sensors={sensors} onDragStart={handleDragStart} onDragOver={handleDragOver} onDragEnd={handleDragEnd}>
+        <div className="flex gap-2 md:gap-3 overflow-x-auto pb-2 -mx-4 px-4 md:mx-0 md:px-0 md:overflow-x-visible kanban-scroll-mobile">
+          {columns.map((status) => (
+            <KanbanColumn
+              key={status}
+              status={status}
+              thoughts={grouped[status] || []}
+              onCardClick={setSelectedThought}
+              onPriorityChange={handlePriorityChange}
+              onArchive={handleArchive}
+              actionsByEntity={actionsByEntity}
+            />
+          ))}
+        </div>
+        <DragOverlay>
+          {activeDragThought && (
+            <div className="rotate-[2deg] opacity-95 shadow-2xl w-[200px]">
+              <KanbanCard
+                thought={activeDragThought}
+                onCardClick={() => {}}
+                onPriorityChange={() => {}}
+              />
+            </div>
+          )}
+        </DragOverlay>
+      </DndContext>
+
+      {/* Modal */}
+      {selectedThought && (
+        <KanbanCardModal
+          thought={selectedThought}
+          onSave={handleModalSave}
+          onArchive={handleArchive}
+          onDelete={handleDelete}
+          onClose={() => setSelectedThought(null)}
+        />
+      )}
+    </>
+  );
+}

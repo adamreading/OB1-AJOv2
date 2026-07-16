@@ -1,0 +1,19 @@
+{
+  "name": "Open Engine",
+  "description": "A shared, durable agent work-queue for Open Brain: multiple agents claim one task at a time, leave standardized receipts, pause for human input, and resume — with a status ledger and optional dashboard board.",
+  "category": "integrations",
+  "author": {
+    "name": "Open Brain (AJO fork)"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": ["Supabase CLI"]
+  },
+  "tags": ["agent-queue", "orchestration", "multi-agent", "work-queue", "coordination", "human-in-the-loop"],
+  "difficulty": "advanced",
+  "estimated_time": "30 minutes",
+  "created": "2026-07-16",
+  "updated": "2026-07-16"
+}

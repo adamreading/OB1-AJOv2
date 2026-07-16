@@ -1,0 +1,17 @@
+{
+  "name": "Cross-Thought Edge Inference",
+  "description": "Build-it-yourself pattern for inferring high-confidence entity relationships implied across multiple thoughts but never stated in any single one, written as distinguishable 'inferred' edges.",
+  "category": "integrations",
+  "author": {
+    "name": "Open Brain (AJO fork)"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": []
+  },
+  "tags": ["graph", "edges", "inference", "entities", "relationships"],
+  "difficulty": "advanced",
+  "estimated_time": "1-2 hours"
+}

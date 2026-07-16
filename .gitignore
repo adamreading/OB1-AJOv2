@@ -1,0 +1,86 @@
+node_modules/
+.DS_Store
+.planning/
+# Maintainer-local overlays (not part of upstream contribution contract)
+.local/
+.agent/
+.claude.json
+.claude/worktrees/
+.claude/settings.json
+.claude/settings.local.json
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Credentials & runtime state
+supabase/.temp/
+.env
+.env.local
+.env.*.local
+credentials.json
+token.json
+gmail-sync-log.json
+sync-log.json
+scripts/.plaud-processed.json
+scripts/edge-snapshots/
+.claude/scheduled_tasks.lock
+start_brain.old
+
+# Plaud curator state — contains personal data (colleague names, company internals,
+# processed Plaud recording IDs). Schemas documented in CLAUDE.local.md.
+processor_prompt/
+
+# Build artifacts
+deno.lock
+
+# Local wiki output — never commit generated wiki files
+wikis/
+compiled-wiki/
+output/
+imports/
+worker-json-failures.log
+
+# Cross-OS coordination board — runtime state (the live shared channel between
+# the Windows + WSL2 Claude Code instances). coord.js + README are committed;
+# the event log and its lock are local runtime, not source.
+.claude/coordination/events.jsonl
+.claude/coordination/*.lock
+# Cross-fleet handoff artifacts (peer-infra detail; Ringer holds the canonical
+# copy in its own repo). Kept local/shared-only so it can't be swept into a
+# public commit — same rationale as keeping the reboot-recovery detail out.
+.claude/coordination/open-engine-blueprint.md
+
+# Brain-content exports + runtime state — personal/work data, never tracked
+consolidation/
+recipes/thought-enrichment/data/
+*.bak-presupersede-*
+
+# ============================================================
+# PRIVATE — NEVER in the public repo (PII / maintainer-only).
+# Public repo carries sanitized, generic content only. Anything that
+# needs a real value at runtime reads it from .env (gitignored) or ships
+# as a *.example twin. Standing PII-handling rules live in CLAUDE.local.md.
+# (Treat every public repo as world-readable forever, git history included.)
+# NOTE: gitignore has NO inline comments — keep patterns on their own lines.
+# ============================================================
+# All agent/working scaffolding (the reusable Open Engine how-to lives in integrations/open-engine/ instead)
+.claude/
+# Rich private ops doc + PII rules; the public CLAUDE.md is the slim sanitized one
+CLAUDE.local.md
+# Personal profile, colleague roster, work email
+docs/curator.md
+# Contains work email
+routines/curator-daily.md
+# Real launcher with local machine paths — public twin: start_brain.example.ps1
+start_brain.ps1
+# AJO-specific operational scripts — personal pipeline, not generic reusable code.
+# The public repo carries a sanitized "build-it-yourself" how-to under integrations/
+# instead (e.g. integrations/plaud-capture/), never the real script.
+scripts/plaud-webhook.js
+scripts/local-brain-worker.js
+scripts/synthesize-persona.mjs
+scripts/infer-entity-edges.mjs
+scripts/plaud-curator-prompt.md
+# Working drafts / design notes — unpolished, often about private pipeline pieces
+docs/drafts/

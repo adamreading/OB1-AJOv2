@@ -1,0 +1,17 @@
+{
+  "name": "Plaud Capture (curator webhook)",
+  "description": "A build-it-yourself pattern for turning an ambient voice-capture device (Plaud or any transcript source) into review-gated Open Brain captures, with a pluggable LLM curator that decides ignore/update/capture per entry.",
+  "category": "integrations",
+  "author": {
+    "name": "Open Brain (AJO fork)"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": []
+  },
+  "tags": ["capture", "voice", "plaud", "curator", "ingestion", "review-gated", "webhook"],
+  "difficulty": "advanced",
+  "estimated_time": "1-2 hours"
+}
