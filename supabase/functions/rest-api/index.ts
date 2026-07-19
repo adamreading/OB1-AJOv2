@@ -4404,12 +4404,21 @@ app.get("/plaud-recordings/:recording_id", async (c) => {
   return c.json({ recording: rec, speakers: speakers ?? [], segments: segments ?? [] }, 200, corsHeaders);
 });
 
-// MARK REVIEWED (or back to pending) — light state toggle for the GUI.
+// MARK REVIEWED (or back to pending) — light state toggle for the GUI. This endpoint
+// ONLY sets review_status. It rejects any other field with 400 rather than silently
+// 200-ing (the footgun: a stray {text}/{start_ms} here does NOT edit anything — those
+// are per-segment fields; use PATCH /plaud-recordings/:recording_id/segments/:idx).
 app.patch("/plaud-recordings/:recording_id", async (c) => {
   const rid = c.req.param("recording_id");
   const body = await c.req.json().catch(() => ({}));
-  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
-  if (body.review_status === "reviewed" || body.review_status === "pending_review") updates.review_status = body.review_status;
+  const unknown = Object.keys(body).filter((k) => k !== "review_status");
+  if (unknown.length) {
+    return c.json({ error: `unrecognised field(s): ${unknown.join(", ")}. This endpoint only sets review_status (reviewed|pending_review); per-segment edits (text/resolved_name/excluded/text_edited) go to PATCH /plaud-recordings/:recording_id/segments/:idx.` }, 400, corsHeaders);
+  }
+  if (body.review_status !== "reviewed" && body.review_status !== "pending_review") {
+    return c.json({ error: "review_status is required and must be 'reviewed' or 'pending_review'" }, 400, corsHeaders);
+  }
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString(), review_status: body.review_status };
   const { data, error } = await supabase.from("plaud_recordings").update(updates).eq("recording_id", rid).select("*").maybeSingle();
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
   if (!data) return c.json({ error: "recording not found" }, 404, corsHeaders);
