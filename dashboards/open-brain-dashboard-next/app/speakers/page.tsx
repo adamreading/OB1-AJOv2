@@ -29,8 +29,12 @@ type Segment = {
   match_confidence: number | null;
   overlap: number | null;   // 0..1 fraction of the turn with 2+ speakers; null = unscored
   excluded?: boolean;       // persistent "exclude from identification" flag (manual or gated)
+  text_edited?: boolean;    // persistent "transcript text hand-corrected by the operator" flag
   text: string | null;
 };
+
+type Hint = { id: number | string; phrase: string; context: string; misheard: string };
+type AdminSpeaker = { id: number | string; name: string; context: string; n_samples: number };
 
 // Two overlap thresholds (the operator's spec):
 //  - TEACH_GATE (0.10): at/above this, the turn won't teach the voice library →
@@ -85,6 +89,19 @@ function SpeakersInner() {
   // "all" shows everything.
   const [filter, setFilter] = useState<"pending" | "reviewed" | "all">("pending");
   const [refreshing, setRefreshing] = useState(false);
+
+  // Per-line transcript-text edit (pencil). editingText = idx being edited.
+  const [editingText, setEditingText] = useState<number | null>(null);
+  const [editTextValue, setEditTextValue] = useState("");
+
+  // Corrections admin panel (speaker Work/Personal + STT hints). Dashboard-only,
+  // proxies to the WSL /admin/* endpoints.
+  const [showCorrections, setShowCorrections] = useState(false);
+  const [adminSpeakers, setAdminSpeakers] = useState<AdminSpeaker[]>([]);
+  const [hints, setHints] = useState<Hint[]>([]);
+  const [adminConfigured, setAdminConfigured] = useState(true);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [newHint, setNewHint] = useState<{ phrase: string; misheard: string; context: "work" | "personal" | "all" }>({ phrase: "", misheard: "", context: "all" });
 
   const loadRecordings = useCallback(async (which: "pending" | "reviewed" | "all" = filter) => {
     const qs = which === "all" ? "" : `?review_status=${which === "reviewed" ? "reviewed" : "pending_review"}`;
@@ -249,6 +266,75 @@ function SpeakersInner() {
     [renaming, renameValue, detail, loadDetail]
   );
 
+  // Save a per-line transcript-text correction. Orthogonal to identity — sets
+  // text + text_edited only, no speaker relabel / voiceprint call.
+  const saveText = useCallback(async (idx: number) => {
+    if (!detail) return;
+    const rid = detail.recording.recording_id;
+    setStatus("Saving text…");
+    try {
+      const res = await fetch(
+        `/api/speakers/segment-text?recording_id=${encodeURIComponent(rid)}&idx=${idx}`,
+        { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: editTextValue }) }
+      );
+      if (res.ok) { setStatus("Text corrected ✓"); setEditingText(null); await loadDetail(rid); }
+      else setStatus(`Text save failed (${res.status})`);
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : "Text save failed");
+    }
+  }, [detail, editTextValue, loadDetail]);
+
+  // Corrections admin — load / mutate the WSL /admin/* data via the proxies.
+  const loadAdmin = useCallback(async () => {
+    setAdminBusy(true);
+    try {
+      const [sp, hi] = await Promise.all([
+        fetch("/api/speakers/admin/speakers").then((r) => r.json()).catch(() => ({ speakers: [] })),
+        fetch("/api/speakers/admin/hints").then((r) => r.json()).catch(() => ({ hints: [] })),
+      ]);
+      setAdminSpeakers(sp.speakers ?? []);
+      setHints(hi.hints ?? []);
+      setAdminConfigured(sp.configured !== false);
+    } finally {
+      setAdminBusy(false);
+    }
+  }, []);
+
+  const setSpeakerContext = useCallback(async (sp: AdminSpeaker, context: "work" | "personal") => {
+    setAdminSpeakers((prev) => prev.map((s) => (s.id === sp.id ? { ...s, context } : s))); // optimistic
+    await fetch("/api/speakers/admin/speakers", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: sp.id, name: sp.name, context }),
+    }).catch(() => {});
+  }, []);
+
+  const addHint = useCallback(async () => {
+    const phrase = newHint.phrase.trim(), misheard = newHint.misheard.trim();
+    if (!phrase || !misheard) { setStatus("A hint needs both the correct phrase and the misheard form(s)."); return; }
+    setAdminBusy(true);
+    try {
+      const res = await fetch("/api/speakers/admin/hints", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phrase, misheard, context: newHint.context }),
+      });
+      if (res.ok) { setNewHint({ phrase: "", misheard: "", context: "all" }); await loadAdmin(); }
+      else setStatus(`Add hint failed (${res.status})`);
+    } finally { setAdminBusy(false); }
+  }, [newHint, loadAdmin]);
+
+  const deleteHint = useCallback(async (id: Hint["id"]) => {
+    setHints((prev) => prev.filter((h) => h.id !== id)); // optimistic
+    await fetch(`/api/speakers/admin/hints?id=${encodeURIComponent(String(id))}`, { method: "DELETE" }).catch(() => {});
+  }, []);
+
+  // Open the corrections panel, optionally pre-filling the misheard word from a
+  // transcript line ("fix transcription" shortcut).
+  const openCorrections = useCallback((prefillMisheard?: string) => {
+    setShowCorrections(true);
+    if (prefillMisheard) setNewHint((h) => ({ ...h, misheard: prefillMisheard }));
+    loadAdmin();
+  }, [loadAdmin]);
+
   const releaseForAnalysis = useCallback(async () => {
     if (!detail) return;
     const rid = detail.recording.recording_id;
@@ -284,11 +370,17 @@ function SpeakersInner() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold">
-            Speakers <span className="text-xs font-normal opacity-50">build m5 · {recordings.length} loaded</span>
+            Speakers <span className="text-xs font-normal opacity-50">build m6 · {recordings.length} loaded</span>
           </h1>
           <p className="text-sm opacity-60">Review transcripts, confirm who spoke, enrol voices into the library.</p>
         </div>
-        <Link href="/review" className="text-sm opacity-70 hover:opacity-100 underline">→ Thought review</Link>
+        <div className="flex items-center gap-3 shrink-0">
+          <button onClick={() => openCorrections()} title="Speaker Work/Personal context + fix recurring mistranscriptions (e.g. 'Remzi' heard as 'Randy')"
+            className="text-sm px-2.5 py-1.5 rounded border border-white/15 opacity-80 hover:opacity-100 whitespace-nowrap">
+            ⚙ Corrections
+          </button>
+          <Link href="/review" className="text-sm opacity-70 hover:opacity-100 underline whitespace-nowrap">→ Thought review</Link>
+        </div>
       </div>
 
       <div className="grid grid-cols-[280px_1fr] gap-4 mobile-stack">
@@ -403,35 +495,64 @@ function SpeakersInner() {
                             className="w-4 h-4 rounded-full border border-white/15 grid place-items-center text-[8px] opacity-60 hover:opacity-100 hover:border-emerald-400 shrink-0">▶</button>
                         </div>
                       </div>
-                      {/* text */}
-                      <div className="min-w-0 pr-6">
-                        <button onClick={() => seekTo(seg)} className={`text-left text-sm leading-relaxed break-words w-full block ${unknown ? "opacity-70" : ""}`}>
-                          {seg.text}
-                          {excluded && (
-                            <span className="ml-2 align-[1px] whitespace-nowrap text-[10.5px] font-mono px-1.5 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/30"
-                              title="Excluded from voice identification — this turn won't teach the voice library (saved). Rename it to re-include.">
-                              ⊘ excluded
-                            </span>
-                          )}
-                          {mixed && (
-                            <span className="ml-2 align-[1px] whitespace-nowrap text-[10.5px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/30"
-                              title="Two or more people speak over this line — it won't teach the voice library">
-                              ⚠ mixed {seg.overlap!.toFixed(2)}
-                            </span>
-                          )}
-                          {wontTeach && (
-                            <span className="ml-2 align-[1px] whitespace-nowrap text-[10px] opacity-45"
-                              title={`Some overlap (${seg.overlap!.toFixed(2)}) — above the ${TEACH_GATE} teaching gate, so this line won't teach the voice library`}>
-                              · won't teach
-                            </span>
-                          )}
-                        </button>
+                      {/* text — inline textarea editor when this line is being corrected */}
+                      <div className="min-w-0 pr-14">
+                        {editingText === seg.idx ? (
+                          <div className="flex flex-col gap-1.5">
+                            <textarea autoFocus value={editTextValue} onChange={(e) => setEditTextValue(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveText(seg.idx); if (e.key === "Escape") setEditingText(null); }}
+                              rows={Math.min(8, Math.max(2, Math.ceil(((editTextValue.length || 40) + 1) / 60)))}
+                              className="w-full px-2 py-1.5 rounded bg-black/40 border border-white/20 text-sm leading-relaxed outline-none focus:border-white/50 resize-y" />
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <button onClick={() => saveText(seg.idx)} className="text-xs px-2.5 py-1 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30">Save text</button>
+                              <button onClick={() => setEditingText(null)} className="text-xs px-2.5 py-1 rounded border border-white/15 opacity-70 hover:opacity-100">Cancel</button>
+                              <span className="text-[10px] opacity-40 whitespace-nowrap">⌘/Ctrl+Enter saves · Esc cancels</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <button onClick={() => seekTo(seg)} className={`text-left text-sm leading-relaxed break-words w-full block ${unknown ? "opacity-70" : ""}`}>
+                            {seg.text}
+                            {seg.text_edited && (
+                              <span className="ml-2 align-[1px] whitespace-nowrap text-[10.5px] font-mono px-1.5 py-0.5 rounded-full bg-violet-500/10 text-violet-300 border border-violet-500/30"
+                                title="Transcript text hand-corrected by you (saved). Preserved on re-ingest and used in analysis.">
+                                ✎ edited
+                              </span>
+                            )}
+                            {excluded && (
+                              <span className="ml-2 align-[1px] whitespace-nowrap text-[10.5px] font-mono px-1.5 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/30"
+                                title="Excluded from voice identification — this turn won't teach the voice library (saved). Rename it to re-include.">
+                                ⊘ excluded
+                              </span>
+                            )}
+                            {mixed && (
+                              <span className="ml-2 align-[1px] whitespace-nowrap text-[10.5px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/30"
+                                title="Two or more people speak over this line — it won't teach the voice library">
+                                ⚠ mixed {seg.overlap!.toFixed(2)}
+                              </span>
+                            )}
+                            {wontTeach && (
+                              <span className="ml-2 align-[1px] whitespace-nowrap text-[10px] opacity-45"
+                                title={`Some overlap (${seg.overlap!.toFixed(2)}) — above the ${TEACH_GATE} teaching gate, so this line won't teach the voice library`}>
+                                · won't teach
+                              </span>
+                            )}
+                          </button>
+                        )}
                       </div>
-                      {/* rename kebab — always tappable (mobile has no hover) */}
-                      <button
-                        onClick={() => { setRenaming({ speakerKey: seg.speaker_key, idx: seg.idx }); setRenameValue(labelFor(seg)); }}
-                        className="absolute top-1.5 right-1.5 w-6 h-6 rounded grid place-items-center text-sm opacity-50 group-hover:opacity-100 hover:bg-white/10 border border-transparent hover:border-white/15"
-                        title="Rename / correct this line's speaker">⋯</button>
+                      {/* action cluster — pencil (edit transcript text) + kebab (speaker).
+                          Always tappable (mobile has no hover). Hidden while editing. */}
+                      {editingText !== seg.idx && (
+                        <div className="absolute top-1.5 right-1.5 flex items-center gap-0.5">
+                          <button
+                            onClick={() => { setEditingText(seg.idx); setEditTextValue(seg.text ?? ""); }}
+                            className="w-6 h-6 rounded grid place-items-center text-xs opacity-50 group-hover:opacity-100 hover:bg-white/10 border border-transparent hover:border-white/15"
+                            title="Edit this line's transcript text">✎</button>
+                          <button
+                            onClick={() => { setRenaming({ speakerKey: seg.speaker_key, idx: seg.idx }); setRenameValue(labelFor(seg)); }}
+                            className="w-6 h-6 rounded grid place-items-center text-sm opacity-50 group-hover:opacity-100 hover:bg-white/10 border border-transparent hover:border-white/15"
+                            title="Rename / correct this line's speaker">⋯</button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -483,6 +604,79 @@ function SpeakersInner() {
               <button onClick={() => submitRename("all")} className="text-xs px-3 py-1.5 rounded bg-violet-500/20 border border-violet-500/40 text-violet-200 hover:bg-violet-500/30">
                 All turns of this speaker
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Corrections admin — speaker Work/Personal context + STT mistranscription
+          hints. Dashboard-only; proxies to the WSL /admin/* endpoints. */}
+      {showCorrections && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-3" onClick={() => setShowCorrections(false)}>
+          <div className="bg-[var(--bg-1,#15151c)] border border-white/15 rounded-lg p-5 w-[560px] max-w-[95vw] max-h-[88vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-base font-medium">Corrections</h3>
+              <button onClick={() => setShowCorrections(false)} className="text-sm opacity-60 hover:opacity-100">✕</button>
+            </div>
+            <p className="text-xs opacity-60 mb-4">
+              Teach recurring fixes: mark each voice Work or Personal, and log words the transcriber mishears (e.g. it writes “Randy”/“Ramsey”, you mean “Remzi”). Corrections are a deterministic find-and-replace on future transcripts — work fixes never touch a personal recording.
+            </p>
+
+            {!adminConfigured && (
+              <p className="text-xs text-amber-400/90 mb-4">The correction service isn’t configured on this machine (WSL_PIPELINE_ADMIN_URL unset) — changes can’t be saved.</p>
+            )}
+
+            {/* Speaker Work/Personal */}
+            <div className="mb-5">
+              <div className="text-xs uppercase tracking-wide opacity-50 mb-2">Speaker context</div>
+              {adminBusy && adminSpeakers.length === 0 && <div className="text-xs opacity-50">Loading…</div>}
+              {!adminBusy && adminSpeakers.length === 0 && <div className="text-xs opacity-50">No enrolled speakers yet.</div>}
+              <div className="flex flex-col gap-1.5">
+                {adminSpeakers.map((s) => (
+                  <div key={String(s.id)} className="flex items-center justify-between gap-2">
+                    <span className="text-sm truncate min-w-0">{s.name} <span className="opacity-40 text-xs">({s.n_samples})</span></span>
+                    <div className="flex gap-1 shrink-0">
+                      {(["work", "personal"] as const).map((c) => (
+                        <button key={c} onClick={() => setSpeakerContext(s, c)}
+                          className={`text-xs px-2 py-0.5 rounded-full border ${s.context === c ? "bg-white/15 border-white/30" : "border-white/10 opacity-60 hover:opacity-100"}`}>
+                          {c}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Mistranscription hints */}
+            <div>
+              <div className="text-xs uppercase tracking-wide opacity-50 mb-2">Mistranscription fixes</div>
+              <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 mb-3">
+                <input value={newHint.phrase} onChange={(e) => setNewHint((h) => ({ ...h, phrase: e.target.value }))}
+                  placeholder="Correct form (e.g. Remzi)" className="px-2 py-1.5 rounded bg-black/30 border border-white/15 text-sm outline-none focus:border-white/40 min-w-0" />
+                <input value={newHint.misheard} onChange={(e) => setNewHint((h) => ({ ...h, misheard: e.target.value }))}
+                  placeholder="Heard as — comma-sep (Randy, Ramsey)" className="px-2 py-1.5 rounded bg-black/30 border border-white/15 text-sm outline-none focus:border-white/40 min-w-0" />
+                <div className="flex gap-1 items-center">
+                  <select value={newHint.context} onChange={(e) => setNewHint((h) => ({ ...h, context: e.target.value as "work" | "personal" | "all" }))}
+                    className="px-2 py-1.5 rounded bg-black/30 border border-white/15 text-sm outline-none">
+                    <option value="all">all</option><option value="work">work</option><option value="personal">personal</option>
+                  </select>
+                  <button onClick={addHint} disabled={adminBusy || !adminConfigured} className="text-xs px-2.5 py-1.5 rounded bg-violet-500/20 border border-violet-500/40 text-violet-200 hover:bg-violet-500/30 disabled:opacity-40">Add</button>
+                </div>
+              </div>
+              <div className="flex flex-col gap-1">
+                {hints.map((h) => (
+                  <div key={String(h.id)} className="flex items-center justify-between gap-2 text-sm border-b border-white/5 py-1">
+                    <span className="min-w-0 truncate">
+                      <span className="text-violet-300">{h.phrase}</span>
+                      <span className="opacity-40"> ← {h.misheard}</span>
+                      <span className="opacity-30 text-xs ml-1">[{h.context}]</span>
+                    </span>
+                    <button onClick={() => deleteHint(h.id)} className="text-xs opacity-50 hover:opacity-100 hover:text-red-300 shrink-0" title="Delete this fix">✕</button>
+                  </div>
+                ))}
+                {hints.length === 0 && !adminBusy && <div className="text-xs opacity-50">No correction fixes yet.</div>}
+              </div>
             </div>
           </div>
         </div>

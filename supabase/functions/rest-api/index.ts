@@ -4335,6 +4335,9 @@ app.post("/plaud-recordings", async (c) => {
     // Persistent "exclude from identification" flag. The pipeline normally omits it
     // (defaults false); preserved on re-ingest only if the pusher echoes it back.
     excluded: s.excluded === true,
+    // Persistent "transcript text hand-edited" flag — same carry-on-re-ingest pattern:
+    // the pusher echoes it (+ the corrected text) so a re-ingest keeps the operator's prose.
+    text_edited: s.text_edited === true,
     text: typeof s.text === "string" ? s.text : null,
   }));
   if (segRows.length) {
@@ -4413,24 +4416,32 @@ app.patch("/plaud-recordings/:recording_id", async (c) => {
   return c.json({ recording: data }, 200, corsHeaders);
 });
 
-// RENAME "just this instance" — override ONE segment's label (diarization slip fix),
-// and/or set the persistent `excluded` flag. Both are optional; at least one required.
+// PATCH ONE segment: rename "just this instance" (diarization slip fix), set the
+// persistent `excluded` flag, and/or correct the transcript `text` (+ `text_edited`).
+// All fields optional; at least one required. Fields are independent — a rename PATCH
+// never touches `text_edited`, so a hand-corrected line keeps its edited mark.
 app.patch("/plaud-recordings/:recording_id/segments/:idx", async (c) => {
   const rid = c.req.param("recording_id");
   const idx = Number(c.req.param("idx"));
   if (!Number.isFinite(idx)) return c.json({ error: "valid segment idx required" }, 400, corsHeaders);
   const body = await c.req.json().catch(() => ({}));
   // name === null clears the override (revert to the speaker's bulk label);
-  // undefined = "don't touch the name" (e.g. an excluded-only PATCH).
+  // undefined = "don't touch the name" (e.g. an excluded-only or text-only PATCH).
   const name = body.resolved_name === null ? null
     : (typeof body.resolved_name === "string" && body.resolved_name.trim() ? body.resolved_name.trim() : undefined);
   // excluded is optional; only written when the caller sends a real boolean.
   const excluded = typeof body.excluded === "boolean" ? body.excluded : undefined;
+  // text is optional; a hand-corrected transcript line. text_edited is the persistent
+  // "this prose is the human's" flag (only written when a real boolean is sent).
+  const text = typeof body.text === "string" ? body.text : undefined;
+  const textEdited = typeof body.text_edited === "boolean" ? body.text_edited : undefined;
   const patch: Record<string, unknown> = {};
   if (name !== undefined) patch.resolved_name_override = name;
   if (excluded !== undefined) patch.excluded = excluded;
+  if (text !== undefined) patch.text = text;
+  if (textEdited !== undefined) patch.text_edited = textEdited;
   if (Object.keys(patch).length === 0) {
-    return c.json({ error: "resolved_name (string|null) or excluded (boolean) required" }, 400, corsHeaders);
+    return c.json({ error: "resolved_name (string|null), excluded (boolean), text (string), or text_edited (boolean) required" }, 400, corsHeaders);
   }
   const { data, error } = await supabase.from("plaud_speaker_segments")
     .update(patch).eq("recording_id", rid).eq("idx", idx).select("*").maybeSingle();
