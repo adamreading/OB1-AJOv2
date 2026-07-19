@@ -4425,6 +4425,24 @@ app.patch("/plaud-recordings/:recording_id", async (c) => {
   return c.json({ recording: data }, 200, corsHeaders);
 });
 
+// DELETE a recording + its speakers/segments (FK ON DELETE CASCADE) — purge a
+// blank/accidental review-queue entry. This touches ONLY the pre-capture Plaud
+// review tables; no `thoughts` are affected (analysis/capture happens later, on
+// Release). Idempotent-ish: 404 if the recording is already gone.
+app.delete("/plaud-recordings/:recording_id", async (c) => {
+  const rid = c.req.param("recording_id");
+  const { data: existing } = await supabase.from("plaud_recordings")
+    .select("recording_id").eq("recording_id", rid).maybeSingle();
+  if (!existing) return c.json({ error: "recording not found" }, 404, corsHeaders);
+  const { count: segCount } = await supabase.from("plaud_speaker_segments")
+    .select("*", { count: "exact", head: true }).eq("recording_id", rid);
+  const { count: spkCount } = await supabase.from("plaud_recording_speakers")
+    .select("*", { count: "exact", head: true }).eq("recording_id", rid);
+  const { error } = await supabase.from("plaud_recordings").delete().eq("recording_id", rid);
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  return c.json({ deleted: true, recording_id: rid, segments_deleted: segCount ?? 0, speakers_deleted: spkCount ?? 0 }, 200, corsHeaders);
+});
+
 // PATCH ONE segment: rename "just this instance" (diarization slip fix), set the
 // persistent `excluded` flag, and/or correct the transcript `text` (+ `text_edited`).
 // All fields optional; at least one required. Fields are independent — a rename PATCH
