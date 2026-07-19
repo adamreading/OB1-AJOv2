@@ -84,3 +84,7 @@ scripts/infer-entity-edges.mjs
 scripts/plaud-curator-prompt.md
 # Working drafts / design notes — unpolished, often about private pipeline pieces
 docs/drafts/
+# Head-of-Security baseline guide + the real do-not-publish terms list (private by
+# definition — a list of what-never-to-share can't itself be shared). Parts 1-3 are
+# generic and safe to copy into a public CLAUDE.md; Part 4 is the scrub list.
+docs/CLAUDE-BASELINE-TEMPLATE.md

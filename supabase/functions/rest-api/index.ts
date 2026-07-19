@@ -344,6 +344,18 @@ app.get("/thoughts", async (c) => {
   if (reviewStatus) {
     query = query.filter("metadata->>review_status", "eq", reviewStatus);
   }
+  // Default-EXCLUDE held escalations from a pending_review pull (regression 2026-07-16:
+  // ajo_curate_pending's GET /thoughts?review_status=pending_review returned OPEN
+  // escalation #6102 to an autonomous curate turn, which merged its content into #29 then
+  // deleted the vessel). FAIL-SAFE: any caller pulling pending items gets held escalations
+  // (escalate=true + escalation_status=open) excluded UNLESS it explicitly opts in with
+  // ?include_escalations=true — which the logged-in human dashboard /review proxy sets, so
+  // the operator still sees + approves escalations there. Null-safe .or so live/ordinary
+  // rows (escalation_status null or != 'open') always stay in.
+  const includeEscalations = c.req.query("include_escalations") === "true";
+  if (reviewStatus === "pending_review" && !includeEscalations) {
+    query = query.or("metadata->>escalation_status.is.null,metadata->>escalation_status.neq.open");
+  }
   if (sourceType) query = query.eq("source_type", sourceType);
   // Sweep selectors for ob_curate_sweep (2026-07-14). resweep_days=N returns
   // never-swept OR last-swept-more-than-N-days-ago (rolling re-sweep); plain
@@ -936,6 +948,33 @@ app.delete("/thought/:id", async (c) => {
   const filter = getIdentityFilter(id);
   const { data: row } = await supabase.from("thoughts").select("*").match(filter).maybeSingle();
   if (!row) return c.json({ error: "thought not found" }, 404, corsHeaders);
+
+  // Escalation guard on the DELETE path (added 2026-07-16 after an AUTONOMOUS curate cron
+  // deleted held-open escalation #6102 via this route — bypassing the /review/approve
+  // human_authorized guard, which only covered approve. Same regression class the escalation
+  // guard exists for, through a second door). A HELD escalation (escalate=true +
+  // escalation_status=open) is waiting for the operator; it MUST NOT be deletable by an
+  // autonomous turn. Same HUMAN-DIRECTED vs AUTONOMOUS line as /review/approve: require
+  // human_authorized (accepted from a JSON body OR ?human_authorized=true). Fail-CLOSED.
+  const dmeta = (row.metadata ?? {}) as Record<string, unknown>;
+  const isHeldEscalation =
+    (dmeta.escalate === true || dmeta.escalate === "true") &&
+    String(dmeta.escalation_status ?? "") === "open";
+  if (isHeldEscalation) {
+    const dbody = await c.req.json().catch(() => ({} as Record<string, unknown>));
+    const humanAuthorized =
+      dbody?.human_authorized === true || dbody?.human_authorized === "true" ||
+      c.req.query("human_authorized") === "true";
+    if (!humanAuthorized) {
+      return c.json({
+        action: "refused",
+        error: "open escalation not deletable without human authorization",
+        message: "this thought is a HELD escalation (escalation_status=open) awaiting the operator's review; an autonomous turn must not delete it. Pass human_authorized:true from a human-directed action (or resolve it via the escalation walk) to delete.",
+        escalation_status: "open",
+      }, 409, corsHeaders);
+    }
+  }
+
   const { data: links } = await supabase
     .from("thought_entities").select("entity_id, mention_role, confidence").eq("thought_id", row.id);
   const { error } = await supabase.from("thoughts").delete().eq("id", row.id);
@@ -1181,7 +1220,7 @@ app.post("/review/approve", async (c) => {
       results.push({
         id: serialId,
         action: "refused",
-        message: "open escalation requires human authorization (approve via the dashboard /review walk); not auto-approvable",
+        message: "open escalation requires explicit human authorization — pass human_authorized:true from a human-DIRECTED approval (the dashboard /review walk, OR the operator's explicit approval in the interactive DM). Not auto-approvable by an autonomous turn.",
       });
       continue;
     }
@@ -4245,6 +4284,184 @@ app.post("/entities/:id/merge", async (c) => {
     target_regen_queued: regenQueued,
     snapshot,
   }, 200, corsHeaders);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plaud local speaker pipeline (Section B) — recordings / segments / speakers.
+// OB stores ONLY non-biometric review artifacts; voiceprint vectors NEVER reach
+// here (they stay in the WSL box's local pgvector — Guardian invariant 2026-07-17).
+// The /speakers dashboard GUI reads these; enrolment (name → voiceprint library)
+// is driven by the LOCAL dashboard, which alone can reach the WSL box.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// INGEST — the WSL pipeline POSTs a transcribed+diarized+matched recording here.
+// Idempotent per recording_id: upserts the recording, then replaces its speakers
+// and segments wholesale (safe to re-run after a re-process). No vectors accepted.
+app.post("/plaud-recordings", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const recordingId = typeof body.recording_id === "string" && body.recording_id.trim() ? body.recording_id.trim() : null;
+  if (!recordingId) return c.json({ error: "recording_id (string) is required" }, 400, corsHeaders);
+  if (!Array.isArray(body.segments)) return c.json({ error: "segments (array) is required" }, 400, corsHeaders);
+
+  const recRow: Record<string, unknown> = {
+    recording_id: recordingId,
+    title: typeof body.title === "string" ? body.title : null,
+    started_at: body.started_at ?? null,
+    duration_ms: Number.isFinite(Number(body.duration_ms)) ? Number(body.duration_ms) : null,
+    audio_ref: typeof body.audio_ref === "string" ? body.audio_ref : null,
+    transcript_text: typeof body.transcript_text === "string" ? body.transcript_text : null,
+    review_status: body.review_status === "reviewed" ? "reviewed" : "pending_review",
+    metadata: (body.metadata && typeof body.metadata === "object") ? body.metadata : {},
+    updated_at: new Date().toISOString(),
+  };
+  const { error: recErr } = await supabase.from("plaud_recordings")
+    .upsert(recRow, { onConflict: "recording_id" });
+  if (recErr) return c.json({ error: recErr.message }, 500, corsHeaders);
+
+  // Replace segments + speakers for a clean re-ingest.
+  await supabase.from("plaud_speaker_segments").delete().eq("recording_id", recordingId);
+  await supabase.from("plaud_recording_speakers").delete().eq("recording_id", recordingId);
+
+  const segRows = body.segments.map((s: Record<string, unknown>, i: number) => ({
+    recording_id: recordingId,
+    idx: Number.isFinite(Number(s.idx)) ? Number(s.idx) : i,
+    start_ms: Number(s.start_ms) || 0,
+    end_ms: Number(s.end_ms) || 0,
+    speaker_key: String(s.speaker_key ?? "S1"),
+    resolved_name_override: typeof s.resolved_name_override === "string" ? s.resolved_name_override : null,
+    match_confidence: Number.isFinite(Number(s.match_confidence)) ? Number(s.match_confidence) : null,
+    // Lever A: per-turn crosstalk overlap (0..1); null = unscored/allowed.
+    overlap: Number.isFinite(Number(s.overlap)) ? Number(s.overlap) : null,
+    // Persistent "exclude from identification" flag. The pipeline normally omits it
+    // (defaults false); preserved on re-ingest only if the pusher echoes it back.
+    excluded: s.excluded === true,
+    text: typeof s.text === "string" ? s.text : null,
+  }));
+  if (segRows.length) {
+    const { error: segErr } = await supabase.from("plaud_speaker_segments").insert(segRows);
+    if (segErr) return c.json({ error: segErr.message }, 500, corsHeaders);
+  }
+
+  // Speakers: use the provided list, else derive distinct keys from segments.
+  let speakerRows: Record<string, unknown>[];
+  if (Array.isArray(body.speakers) && body.speakers.length) {
+    speakerRows = body.speakers.map((sp: Record<string, unknown>) => ({
+      recording_id: recordingId,
+      speaker_key: String(sp.speaker_key ?? "S1"),
+      resolved_name: typeof sp.resolved_name === "string" ? sp.resolved_name : null,
+      match_confidence: Number.isFinite(Number(sp.match_confidence)) ? Number(sp.match_confidence) : null,
+      enrolled: sp.enrolled === true,
+      updated_at: new Date().toISOString(),
+    }));
+  } else {
+    const seen = new Map<string, Record<string, unknown>>();
+    for (const s of segRows) {
+      if (!seen.has(s.speaker_key)) {
+        seen.set(s.speaker_key, {
+          recording_id: recordingId, speaker_key: s.speaker_key,
+          resolved_name: null, match_confidence: s.match_confidence, enrolled: false,
+          updated_at: new Date().toISOString(),
+        });
+      }
+    }
+    speakerRows = [...seen.values()];
+  }
+  if (speakerRows.length) {
+    const { error: spErr } = await supabase.from("plaud_recording_speakers").insert(speakerRows);
+    if (spErr) return c.json({ error: spErr.message }, 500, corsHeaders);
+  }
+
+  return c.json({ recording_id: recordingId, segments: segRows.length, speakers: speakerRows.length }, 201, corsHeaders);
+});
+
+// LIST — for the /speakers GUI. Newest first; ?review_status= filters.
+app.get("/plaud-recordings", async (c) => {
+  const status = c.req.query("review_status");
+  const limit = Math.min(500, Math.max(1, Number(c.req.query("limit") ?? 100)));
+  let q = supabase.from("plaud_recordings")
+    .select("id, recording_id, title, started_at, duration_ms, audio_ref, review_status, created_at, updated_at")
+    .order("created_at", { ascending: false }).limit(limit);
+  if (status) q = q.eq("review_status", status);
+  const { data, error } = await q;
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  return c.json({ recordings: data ?? [] }, 200, corsHeaders);
+});
+
+// DETAIL — recording + its speakers + ordered segments.
+app.get("/plaud-recordings/:recording_id", async (c) => {
+  const rid = c.req.param("recording_id");
+  const { data: rec, error: recErr } = await supabase.from("plaud_recordings")
+    .select("*").eq("recording_id", rid).maybeSingle();
+  if (recErr) return c.json({ error: recErr.message }, 500, corsHeaders);
+  if (!rec) return c.json({ error: "recording not found" }, 404, corsHeaders);
+  const { data: speakers } = await supabase.from("plaud_recording_speakers")
+    .select("*").eq("recording_id", rid).order("speaker_key");
+  const { data: segments } = await supabase.from("plaud_speaker_segments")
+    .select("*").eq("recording_id", rid).order("idx");
+  return c.json({ recording: rec, speakers: speakers ?? [], segments: segments ?? [] }, 200, corsHeaders);
+});
+
+// MARK REVIEWED (or back to pending) — light state toggle for the GUI.
+app.patch("/plaud-recordings/:recording_id", async (c) => {
+  const rid = c.req.param("recording_id");
+  const body = await c.req.json().catch(() => ({}));
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (body.review_status === "reviewed" || body.review_status === "pending_review") updates.review_status = body.review_status;
+  const { data, error } = await supabase.from("plaud_recordings").update(updates).eq("recording_id", rid).select("*").maybeSingle();
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!data) return c.json({ error: "recording not found" }, 404, corsHeaders);
+  return c.json({ recording: data }, 200, corsHeaders);
+});
+
+// RENAME "just this instance" — override ONE segment's label (diarization slip fix),
+// and/or set the persistent `excluded` flag. Both are optional; at least one required.
+app.patch("/plaud-recordings/:recording_id/segments/:idx", async (c) => {
+  const rid = c.req.param("recording_id");
+  const idx = Number(c.req.param("idx"));
+  if (!Number.isFinite(idx)) return c.json({ error: "valid segment idx required" }, 400, corsHeaders);
+  const body = await c.req.json().catch(() => ({}));
+  // name === null clears the override (revert to the speaker's bulk label);
+  // undefined = "don't touch the name" (e.g. an excluded-only PATCH).
+  const name = body.resolved_name === null ? null
+    : (typeof body.resolved_name === "string" && body.resolved_name.trim() ? body.resolved_name.trim() : undefined);
+  // excluded is optional; only written when the caller sends a real boolean.
+  const excluded = typeof body.excluded === "boolean" ? body.excluded : undefined;
+  const patch: Record<string, unknown> = {};
+  if (name !== undefined) patch.resolved_name_override = name;
+  if (excluded !== undefined) patch.excluded = excluded;
+  if (Object.keys(patch).length === 0) {
+    return c.json({ error: "resolved_name (string|null) or excluded (boolean) required" }, 400, corsHeaders);
+  }
+  const { data, error } = await supabase.from("plaud_speaker_segments")
+    .update(patch).eq("recording_id", rid).eq("idx", idx).select("*").maybeSingle();
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!data) return c.json({ error: "segment not found" }, 404, corsHeaders);
+  return c.json({ segment: data }, 200, corsHeaders);
+});
+
+// RENAME "all instances of Speaker X" + mark enrolled — the bulk relabel /
+// enrolment path. Updates OB's own labels ONLY. The actual voiceprint enrolment
+// (name → WSL library) is fired by the LOCAL dashboard, which can reach the box;
+// this Edge Function can't. Clearing per-segment overrides for the speaker so the
+// bulk name takes effect everywhere is optional via ?clear_overrides=1.
+app.patch("/plaud-recordings/:recording_id/speakers/:speaker_key", async (c) => {
+  const rid = c.req.param("recording_id");
+  const key = c.req.param("speaker_key");
+  const body = await c.req.json().catch(() => ({}));
+  const name = body.resolved_name === null ? null
+    : (typeof body.resolved_name === "string" && body.resolved_name.trim() ? body.resolved_name.trim() : undefined);
+  if (name === undefined) return c.json({ error: "resolved_name (string) or null required" }, 400, corsHeaders);
+  const updates: Record<string, unknown> = { resolved_name: name, updated_at: new Date().toISOString() };
+  if (body.enrolled === true) updates.enrolled = true;
+  const { data, error } = await supabase.from("plaud_recording_speakers")
+    .update(updates).eq("recording_id", rid).eq("speaker_key", key).select("*").maybeSingle();
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!data) return c.json({ error: "speaker not found" }, 404, corsHeaders);
+  if (c.req.query("clear_overrides") === "1") {
+    await supabase.from("plaud_speaker_segments")
+      .update({ resolved_name_override: null }).eq("recording_id", rid).eq("speaker_key", key);
+  }
+  return c.json({ speaker: data }, 200, corsHeaders);
 });
 
 // Double Mount — handles both /rest-api/... and /...

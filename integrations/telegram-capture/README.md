@@ -322,7 +322,7 @@ Replace each placeholder with your real value (no angle brackets):
 
 ```bash
 supabase secrets set \
-  TELEGRAM_BOT_TOKEN="123456789:ABCdefGhIJKlmnoPQRstUVwxYZ" \
+  TELEGRAM_BOT_TOKEN="123456789:your-bot-token-from-botfather" \
   TELEGRAM_CAPTURE_CHAT_ID="987654321" \
   TELEGRAM_WEBHOOK_SECRET="paste_the_hex_string_from_4a_here" \
   OPENROUTER_API_KEY="sk-or-v1-your-openrouter-key"

@@ -1,0 +1,7 @@
+# Keep the pre-push security gate LF on every platform. A CRLF shebang/line
+# would break the /bin/sh hook, silently disabling the gate (fail-OPEN) — the
+# worst failure mode for a security tool. Force LF regardless of core.autocrlf.
+scripts/hooks/*                text eol=lf
+scripts/checks/*.sh            text eol=lf
+scripts/pii_secret_scan.py     text eol=lf
+*.sh                           text eol=lf

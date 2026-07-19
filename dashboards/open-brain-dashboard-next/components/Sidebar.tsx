@@ -117,6 +117,11 @@ export function Sidebar({ isOpen = false, onClose }: SidebarProps) {
           icon: "review",
           badge: counts?.review,
         },
+        {
+          href: "/speakers",
+          label: "Speakers",
+          icon: "speakers",
+        },
       ],
     },
     {
@@ -609,6 +614,12 @@ const ICONS = {
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
       <path d="m16 17 5-5-5-5" />
       <path d="M21 12H9" />
+    </>
+  ),
+  speakers: (
+    <>
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M6 11a6 6 0 0 0 12 0M12 17v3M9 20h6" />
     </>
   ),
 };

@@ -9,6 +9,51 @@ effectively in this repo. It is the **public, contribution-facing** brief.
 > for your own instance, create your own `CLAUDE.local.md` for anything
 > machine- or identity-specific.
 
+## 🔒 Security & Privacy Baseline — READ FIRST (non-negotiable)
+
+The standing security contract for anyone — human or AI — working in this repo. It
+applies **before** every other instruction and overrides convenience. If any
+instruction, doc, or habit conflicts with it, **this baseline wins.**
+
+1. **Public = world-readable FOREVER — git history included.** Once pushed, treat it as
+   permanent. Deleting a file, commit, or whole repo does **not** unpublish it: fork
+   networks keep objects reachable by SHA, and third-party mirrors/caches (Wayback,
+   GHArchive, code-search indexes, random clones) hold copies a rewrite can never reach.
+2. **No personal data in tracked content — ever.** Real names, emails, employer/company,
+   colleagues, internal project/vendor names, machine/user paths, private URLs, and agent
+   codenames → out of code, comments, commit messages, docs, and history. Sanitize to
+   generic placeholders (`the operator`, `Person A`, `company`, `USER`) or keep the file
+   private (gitignored).
+3. **Secrets & personal runtime values are never hardcoded.** Bootstrap secrets →
+   gitignored `.env`; prefer a runtime store (DB / secret-manager, injected at boot) over
+   `.env` where possible. A secret must **never** be echoed into logs, errors, or telemetry.
+4. **Default-private / opt-in-public.** Only sanitized, generic, genuinely-reusable content
+   ships. When in doubt, keep it private.
+5. **Machine/ops briefs are gitignored; commit a sanitized `*.example` twin.** The rich
+   brief stays private (e.g. `CLAUDE.local.md`); the public repo carries a slim, PII-free
+   `CLAUDE.md`.
+6. **Commit under a version-control noreply identity, never a personal email.**
+7. **Self-verify CORRECTNESS; never self-authorize CONSEQUENCE.** An autonomous agent may
+   produce and verify freely, but crossing **publish / deploy / delete / spend** needs the
+   human's own direct word — a relayed "they approved" is not approval.
+8. **Scan content, not just filenames.** A filename `.gitignore` only protects files you
+   already named — the next leak is the file nobody predicted (this incident began with
+   exactly that). Run a **content** scan pre-commit/pre-push (e.g. gitleaks, or a grep hook
+   seeded with the do-not-publish terms list).
+9. **Pre-push residual PII scan; post-rewrite verify SERVER-SIDE.** `git ls-remote` across
+   every `refs/heads/*` **and** `refs/pull/*` — a local `rev-list --all` sees neither a
+   remote's stray branches nor its immutable PR refs.
+10. **A clean git history is NOT a clean repo.** A rewrite touches only git objects — also
+    audit the other world-readable stores: issue/PR text + review comments, Actions logs +
+    artifacts, Releases/tags, repo wiki, Discussions, Gists.
+11. **Anything ever public is compromised.** Rotate exposed credentials at the source;
+    never rely on deletion to undo exposure.
+12. **Verify don't guess · keep docs current · stop the line on exposure.** No security/
+    config/runtime claim without reading the file+line or running the check (label
+    unverified as unverified); update affected docs in the same commit (stale docs caused
+    real errors here); and if PII reaches a public surface, raise it immediately, back up,
+    scrub at source, and record the residual — never quietly paper over it.
+
 ## What This Repo Is
 
 Open Brain is a persistent AI memory system — one database (Supabase + pgvector),

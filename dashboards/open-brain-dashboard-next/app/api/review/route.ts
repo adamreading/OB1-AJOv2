@@ -25,6 +25,11 @@ export async function GET(request: NextRequest) {
     source_type: "plaud",
     per_page: "50",
     page,
+    // This is the logged-in human review surface — it MUST see held escalations so the
+    // operator can approve them (with human_authorized via the session). rest-api
+    // default-excludes escalations from pending_review pulls to keep them away from
+    // autonomous curate turns (regression 2026-07-16); the human path opts back in.
+    include_escalations: "true",
   });
   if (classification) sp.set("classification", classification);
 

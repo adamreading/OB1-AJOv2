@@ -1264,18 +1264,27 @@ function createServer(): McpServer {
     "list_pending_review",
     {
       title: "List Pending Review",
-      description: "List thoughts queued for review (metadata.review_status = 'pending_review'). Used by the curator for daily triage. Returns serial ID, source, decision type (NEW or UPDATE), sensitivity tier, content length, and a content preview so the curator can decide approve vs. hold.",
+      description: "List thoughts queued for review (metadata.review_status = 'pending_review'). Used by the curator for daily triage. Returns serial ID, source, decision type (NEW or UPDATE), sensitivity tier, content length, and a content preview so the curator can decide approve vs. hold. HELD escalations (escalate=true + escalation_status=open) are EXCLUDED by default — they await the operator's own review and must never be fed to an autonomous curate sweep; set include_escalations=true only for a deliberate human-directed triage.",
       annotations: { readOnlyHint: true },
       inputSchema: {
         limit: z.number().optional().default(50),
+        include_escalations: z.boolean().optional().default(false).describe("Include HELD escalations (escalate=true + escalation_status=open). DEFAULT false: held items await the operator's OWN review and must never be handed to an autonomous curate turn (regression 2026-07-16: a curate cron selected held #6102 via this list, then merged+deleted it). They surface via the dedicated escalations queue. Set true only for a human-directed triage that deliberately wants them."),
       },
     },
-    async ({ limit }) => {
+    async ({ limit, include_escalations }) => {
       try {
-        const { data, error } = await supabase
+        let query = supabase
           .from("thoughts")
           .select("serial_id, content, source_type, classification, metadata, created_at")
-          .filter("metadata->>review_status", "eq", "pending_review")
+          .filter("metadata->>review_status", "eq", "pending_review");
+        // Exclude open escalations by default so a held item is never even SHOWN to an
+        // autonomous curate sweep (the DELETE guard stops the deletion; this stops the
+        // unauthorized read/merge too). Null-safe: keep rows where escalation_status IS
+        // NULL or != 'open' — a bare .neq would also drop the nulls (live/ordinary rows).
+        if (!include_escalations) {
+          query = query.or("metadata->>escalation_status.is.null,metadata->>escalation_status.neq.open");
+        }
+        const { data, error } = await query
           .order("created_at", { ascending: false })
           .limit(limit);
 
@@ -1303,13 +1312,20 @@ function createServer(): McpServer {
     "approve_pending",
     {
       title: "Approve Pending Thoughts",
-      description: "Approve one or more pending-review thoughts by serial ID. Delegates to the REST API /review/approve endpoint — same path the dashboard uses. NEW decisions: clears review_status and queues for entity extraction + embedding. UPDATE decisions: applies proposed content to the target thought, archives old version, re-queues extraction, deletes the pending vessel. Only call after list_pending_review — do not approve sensitivity_tier='personal' or 'restricted' captures without the operator's explicit sign-off.",
+      description: "Approve one or more pending-review thoughts by serial ID. Delegates to the REST API /review/approve endpoint — same path the dashboard uses. NEW decisions: clears review_status and queues for entity extraction + embedding. UPDATE decisions: applies proposed content to the target thought, archives old version, re-queues extraction, deletes the pending vessel. Only call after list_pending_review — do not approve sensitivity_tier='personal' or 'restricted' captures without the operator's explicit sign-off. For an OPEN ESCALATION (escalate=true), pass human_authorized:true ONLY on the operator's explicit interactive approval (DM or dashboard); autonomous turns must omit it and will be refused.",
       annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         ids: z.array(z.number()).describe("Serial IDs of pending thoughts to approve"),
+        // Human-authorization for OPEN ESCALATIONS (escalate=true + escalation_status=open).
+        // The REST /review/approve guard refuses such items unless human_authorized:true. The
+        // REAL line is HUMAN-DIRECTED vs AUTONOMOUS, not which surface: set this true ONLY when
+        // the operator has EXPLICITLY approved this turn in a human-directed channel (the
+        // operator-only interactive DM, or the dashboard). NEVER set it on an autonomous / cron /
+        // reactive-review turn — that re-opens the exact hole the escalation guard closes.
+        human_authorized: z.boolean().optional().describe("Set true ONLY when the operator explicitly approved this in an interactive human-directed turn (e.g. the operator-only DM). Required to approve an OPEN ESCALATION; never set on autonomous turns."),
       },
     },
-    async ({ ids }) => {
+    async ({ ids, human_authorized }) => {
       try {
         const res = await fetch(`${SUPABASE_URL}/functions/v1/rest-api/review/approve`, {
           method: "POST",
@@ -1317,7 +1333,10 @@ function createServer(): McpServer {
             "x-brain-key": MCP_ACCESS_KEY,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ ids }),
+          // Forward the human-authorization flag so an operator-directed DM approval clears the
+          // escalation guard (REST is the single source of truth). Normalized to a strict
+          // boolean; absent/false → autonomous callers still get refused on open escalations.
+          body: JSON.stringify({ ids, human_authorized: human_authorized === true }),
         });
         if (!res.ok) {
           const msg = await res.text().catch(() => res.statusText);

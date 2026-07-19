@@ -719,7 +719,7 @@ export function WikiGraphView({
   // on `graph.nodes` here would create an infinite loop because the fetch
   // effect that consumes searchFocusId is exactly what updates graph.nodes.
   // Scoring prefers exact title hits over substring hits over alias-only
-  // hits, so "Peter" lands on Peter, not "Peter Seibert" or peterpease.com.
+  // hits, so "Ann" lands on Ann, not "Ann Other" or annother.example.
   const searchFocusId = useMemo<number | null>(() => {
     if (searchMatchIds.size === 0) return null;
     const q = searchQuery.trim().toLowerCase();
