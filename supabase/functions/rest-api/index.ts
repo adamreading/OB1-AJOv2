@@ -4411,14 +4411,27 @@ app.get("/plaud-recordings/:recording_id", async (c) => {
 app.patch("/plaud-recordings/:recording_id", async (c) => {
   const rid = c.req.param("recording_id");
   const body = await c.req.json().catch(() => ({}));
-  const unknown = Object.keys(body).filter((k) => k !== "review_status");
+  const ALLOWED = new Set(["review_status", "summary_md"]);
+  const unknown = Object.keys(body).filter((k) => !ALLOWED.has(k));
   if (unknown.length) {
-    return c.json({ error: `unrecognised field(s): ${unknown.join(", ")}. This endpoint only sets review_status (reviewed|pending_review); per-segment edits (text/resolved_name/excluded/text_edited) go to PATCH /plaud-recordings/:recording_id/segments/:idx.` }, 400, corsHeaders);
+    return c.json({ error: `unrecognised field(s): ${unknown.join(", ")}. This endpoint accepts review_status and/or summary_md; per-segment edits (text/resolved_name/excluded/text_edited) go to PATCH /plaud-recordings/:recording_id/segments/:idx.` }, 400, corsHeaders);
   }
-  if (body.review_status !== "reviewed" && body.review_status !== "pending_review") {
-    return c.json({ error: "review_status is required and must be 'reviewed' or 'pending_review'" }, 400, corsHeaders);
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if ("review_status" in body) {
+    if (body.review_status !== "reviewed" && body.review_status !== "pending_review") {
+      return c.json({ error: "review_status must be 'reviewed' or 'pending_review'" }, 400, corsHeaders);
+    }
+    updates.review_status = body.review_status;
   }
-  const updates: Record<string, unknown> = { updated_at: new Date().toISOString(), review_status: body.review_status };
+  if ("summary_md" in body) {
+    if (body.summary_md !== null && typeof body.summary_md !== "string") {
+      return c.json({ error: "summary_md must be a string or null" }, 400, corsHeaders);
+    }
+    updates.summary_md = body.summary_md;
+  }
+  if (Object.keys(updates).length === 1) {  // only updated_at ⇒ nothing real supplied
+    return c.json({ error: "provide review_status and/or summary_md" }, 400, corsHeaders);
+  }
   const { data, error } = await supabase.from("plaud_recordings").update(updates).eq("recording_id", rid).select("*").maybeSingle();
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
   if (!data) return c.json({ error: "recording not found" }, 404, corsHeaders);

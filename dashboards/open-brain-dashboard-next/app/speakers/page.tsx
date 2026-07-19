@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, Suspense } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, Suspense, type ReactNode } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
@@ -43,10 +43,57 @@ type AdminSpeaker = { id: number | string; name: string; context: string; n_samp
 const TEACH_GATE = 0.10;
 const OVERLAP_GATE = 0.40;
 type Detail = {
-  recording: RecordingSummary & { transcript_text: string | null; audio_ref: string | null };
+  recording: RecordingSummary & { transcript_text: string | null; audio_ref: string | null; summary_md?: string | null };
   speakers: Speaker[];
   segments: Segment[];
 };
+
+// Compact inline markdown → JSX: **bold**, *italic*, `code`. Safe (no dangerouslySet).
+function inlineMd(text: string, keyBase: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  const re = /(\*\*([^*]+)\*\*|`([^`]+)`|\*([^*]+)\*)/g;
+  let last = 0, m: RegExpExecArray | null, i = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[2] !== undefined) out.push(<strong key={`${keyBase}-b${i}`}>{m[2]}</strong>);
+    else if (m[3] !== undefined) out.push(<code key={`${keyBase}-c${i}`} className="px-1 py-0.5 rounded bg-white/10 text-[0.85em]">{m[3]}</code>);
+    else if (m[4] !== undefined) out.push(<em key={`${keyBase}-i${i}`}>{m[4]}</em>);
+    last = m.index + m[0].length; i++;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+// Lightweight block markdown renderer for terra summaries: #/##/### headings,
+// - / * bullet lists, 1. numbered lists, blank-line paragraphs. No external dep.
+function SummaryMarkdown({ md }: { md: string }) {
+  const lines = md.replace(/\r\n/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let list: { ordered: boolean; items: string[] } | null = null;
+  let para: string[] = [];
+  const flushPara = () => { if (para.length) { blocks.push(<p key={`p${blocks.length}`} className="mb-3 leading-relaxed">{inlineMd(para.join(" "), `p${blocks.length}`)}</p>); para = []; } };
+  const flushList = () => {
+    if (!list) return;
+    const items = list.items.map((it, j) => <li key={j} className="mb-1">{inlineMd(it, `li${blocks.length}-${j}`)}</li>);
+    blocks.push(list.ordered
+      ? <ol key={`l${blocks.length}`} className="list-decimal ml-5 mb-3">{items}</ol>
+      : <ul key={`l${blocks.length}`} className="list-disc ml-5 mb-3">{items}</ul>);
+    list = null;
+  };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const h = /^(#{1,3})\s+(.*)$/.exec(line);
+    const bullet = /^[-*]\s+(.*)$/.exec(line);
+    const num = /^\d+\.\s+(.*)$/.exec(line);
+    if (h) { flushPara(); flushList(); const lvl = h[1].length; const cls = lvl === 1 ? "text-lg font-semibold mt-4 mb-2" : lvl === 2 ? "text-base font-semibold mt-3 mb-2" : "text-sm font-semibold mt-2 mb-1"; blocks.push(<div key={`h${blocks.length}`} className={cls}>{inlineMd(h[2], `h${blocks.length}`)}</div>); }
+    else if (bullet) { flushPara(); if (!list || list.ordered) { flushList(); list = { ordered: false, items: [] }; } list.items.push(bullet[1]); }
+    else if (num) { flushPara(); if (!list || !list.ordered) { flushList(); list = { ordered: true, items: [] }; } list.items.push(num[1]); }
+    else if (line === "") { flushPara(); flushList(); }
+    else { flushList(); para.push(line); }
+  }
+  flushPara(); flushList();
+  return <div className="text-sm">{blocks}</div>;
+}
 
 const SPEAKER_COLORS = [
   "#7c9cff", "#ff9c7c", "#7cffb0", "#e07cff", "#ffd67c", "#7ce0ff", "#ff7ca8", "#b0ff7c",
@@ -106,6 +153,9 @@ function SpeakersInner() {
   // Delete / bulk-purge review-queue recordings (blank/accidental or backlog reset).
   const [deleting, setDeleting] = useState(false);
   const [purging, setPurging] = useState(false);
+
+  // Transcript summary panel (terra-generated markdown, shown for reviewed recordings).
+  const [showSummary, setShowSummary] = useState(false);
 
   const loadRecordings = useCallback(async (which: "pending" | "reviewed" | "all" = filter) => {
     const qs = which === "all" ? "" : `?review_status=${which === "reviewed" ? "reviewed" : "pending_review"}`;
@@ -415,7 +465,7 @@ function SpeakersInner() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold">
-            Speakers <span className="text-xs font-normal opacity-50">build m7 · {recordings.length} loaded</span>
+            Speakers <span className="text-xs font-normal opacity-50">build m8 · {recordings.length} loaded</span>
           </h1>
           <p className="text-sm opacity-60">Review transcripts, confirm who spoke, enrol voices into the library.</p>
         </div>
@@ -500,6 +550,11 @@ function SpeakersInner() {
                   <button onClick={releaseForAnalysis} title="Confirm the speakers are correct and release this recording for analysis" className="text-xs px-2.5 py-1.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/25 whitespace-nowrap shrink-0">
                     Release
                   </button>
+                  {detail.recording.summary_md && (
+                    <button onClick={() => setShowSummary(true)} title="View the written summary of this transcript" className="text-xs px-2.5 py-1.5 rounded bg-violet-500/15 text-violet-200 border border-violet-500/30 hover:bg-violet-500/25 whitespace-nowrap shrink-0">
+                      Summary
+                    </button>
+                  )}
                   <button onClick={deleteRecording} disabled={deleting} title="Delete this recording from the review queue (blank/accidental) — no thoughts affected" className="text-xs px-2 py-1.5 rounded border border-red-500/30 text-red-300/80 hover:bg-red-500/10 disabled:opacity-40 whitespace-nowrap shrink-0">
                     {deleting ? "…" : "Delete"}
                   </button>
@@ -734,6 +789,26 @@ function SpeakersInner() {
                 {hints.length === 0 && !adminBusy && <div className="text-xs opacity-50">No correction fixes yet.</div>}
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Transcript summary — terra-generated markdown, rendered + copy-to-clipboard. */}
+      {showSummary && detail?.recording.summary_md && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-3" onClick={() => setShowSummary(false)}>
+          <div className="bg-[var(--bg-1,#15151c)] border border-white/15 rounded-lg p-5 w-[720px] max-w-[95vw] max-h-[88vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3 gap-2">
+              <h3 className="text-base font-medium truncate min-w-0">Summary — {prettyTitle(detail.recording.title || detail.recording.recording_id)}</h3>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={async () => { try { await navigator.clipboard.writeText(detail.recording.summary_md || ""); setStatus("Summary copied ✓"); } catch { setStatus("Copy failed — select + copy manually"); } }}
+                  className="text-xs px-2.5 py-1 rounded border border-white/15 opacity-80 hover:opacity-100" title="Copy the markdown">
+                  Copy markdown
+                </button>
+                <button onClick={() => setShowSummary(false)} className="text-sm opacity-60 hover:opacity-100">✕</button>
+              </div>
+            </div>
+            <SummaryMarkdown md={detail.recording.summary_md} />
           </div>
         </div>
       )}
