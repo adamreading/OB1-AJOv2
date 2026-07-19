@@ -103,6 +103,10 @@ function SpeakersInner() {
   const [adminBusy, setAdminBusy] = useState(false);
   const [newHint, setNewHint] = useState<{ phrase: string; misheard: string; context: "work" | "personal" | "all" }>({ phrase: "", misheard: "", context: "all" });
 
+  // Delete / bulk-purge review-queue recordings (blank/accidental or backlog reset).
+  const [deleting, setDeleting] = useState(false);
+  const [purging, setPurging] = useState(false);
+
   const loadRecordings = useCallback(async (which: "pending" | "reviewed" | "all" = filter) => {
     const qs = which === "all" ? "" : `?review_status=${which === "reviewed" ? "reviewed" : "pending_review"}`;
     try {
@@ -365,12 +369,53 @@ function SpeakersInner() {
     }
   }, [detail, loadRecordings, filter, loadDetail]);
 
+  // Delete ONE recording from the review queue (blank/accidental). Pre-capture data;
+  // no thoughts touched. Native confirm — it's destructive + can't be undone.
+  const deleteRecording = useCallback(async () => {
+    if (!detail) return;
+    const rid = detail.recording.recording_id;
+    if (!window.confirm(`Delete this recording + its transcript from the review queue?\n\n${prettyTitle(detail.recording.title || rid)}\n\nCan't be undone. No captured thoughts are affected.`)) return;
+    setDeleting(true);
+    setStatus("Deleting…");
+    try {
+      const res = await fetch(`/api/speakers/delete?recording_id=${encodeURIComponent(rid)}`, { method: "DELETE" });
+      if (res.ok) {
+        const j = await res.json();
+        setStatus(`Deleted (${j.segments_deleted ?? 0} segments)`);
+        setSelectedId(null); setDetail(null);
+        await loadRecordings(filter);
+      } else setStatus(`Delete failed (${res.status})`);
+    } catch (e) { setStatus(e instanceof Error ? e.message : "Delete failed"); }
+    finally { setDeleting(false); }
+  }, [detail, loadRecordings, filter]);
+
+  // Bulk-purge every recording in the current status filter (e.g. clear the stale
+  // pending backlog to restart a clean drip). Only offered for pending/reviewed, never "all".
+  const purgeCurrent = useCallback(async () => {
+    if (filter === "all") return;
+    const status = filter === "reviewed" ? "reviewed" : "pending_review";
+    const n = recordings.length;
+    if (!window.confirm(`Delete ALL ${n} ${filter} recording(s) from the review queue?\n\nClears the backlog. Can't be undone. No captured thoughts are affected.`)) return;
+    setPurging(true);
+    setStatus(`Purging ${filter}…`);
+    try {
+      const res = await fetch(`/api/speakers/purge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ review_status: status }) });
+      if (res.ok) {
+        const j = await res.json();
+        setStatus(`Purged ${j.deleted ?? 0} recording(s)`);
+        setSelectedId(null); setDetail(null);
+        await loadRecordings(filter);
+      } else setStatus(`Purge failed (${res.status})`);
+    } catch (e) { setStatus(e instanceof Error ? e.message : "Purge failed"); }
+    finally { setPurging(false); }
+  }, [filter, recordings.length, loadRecordings]);
+
   return (
     <div className="p-4 sm:p-6 max-w-[1400px] mx-auto overflow-x-hidden">
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold">
-            Speakers <span className="text-xs font-normal opacity-50">build m6 · {recordings.length} loaded</span>
+            Speakers <span className="text-xs font-normal opacity-50">build m7 · {recordings.length} loaded</span>
           </h1>
           <p className="text-sm opacity-60">Review transcripts, confirm who spoke, enrol voices into the library.</p>
         </div>
@@ -392,9 +437,17 @@ function SpeakersInner() {
           <div className="px-3 py-2 border-b border-white/10">
             <div className="flex items-center justify-between mb-2">
               <span className="text-xs uppercase tracking-wide opacity-50">Recordings ({recordings.length})</span>
-              <button onClick={manualRefresh} title="Refresh list" className="text-xs opacity-60 hover:opacity-100">
-                {refreshing ? "…" : "↻"}
-              </button>
+              <div className="flex items-center gap-2.5">
+                {filter !== "all" && recordings.length > 0 && (
+                  <button onClick={purgeCurrent} disabled={purging} title={`Delete all ${recordings.length} ${filter} recordings from the review queue`}
+                    className="text-xs text-red-300/80 hover:text-red-300 disabled:opacity-40">
+                    {purging ? "…" : `clear ${filter}`}
+                  </button>
+                )}
+                <button onClick={manualRefresh} title="Refresh list" className="text-xs opacity-60 hover:opacity-100">
+                  {refreshing ? "…" : "↻"}
+                </button>
+              </div>
             </div>
             <div className="flex gap-1">
               {(["pending", "reviewed", "all"] as const).map((f) => (
@@ -446,6 +499,9 @@ function SpeakersInner() {
                   </h2>
                   <button onClick={releaseForAnalysis} title="Confirm the speakers are correct and release this recording for analysis" className="text-xs px-2.5 py-1.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/25 whitespace-nowrap shrink-0">
                     Release
+                  </button>
+                  <button onClick={deleteRecording} disabled={deleting} title="Delete this recording from the review queue (blank/accidental) — no thoughts affected" className="text-xs px-2 py-1.5 rounded border border-red-500/30 text-red-300/80 hover:bg-red-500/10 disabled:opacity-40 whitespace-nowrap shrink-0">
+                    {deleting ? "…" : "Delete"}
                   </button>
                 </div>
                 <audio ref={audioRef} controls preload="metadata" className="w-full max-w-full h-9"

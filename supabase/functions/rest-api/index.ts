@@ -4443,6 +4443,28 @@ app.delete("/plaud-recordings/:recording_id", async (c) => {
   return c.json({ deleted: true, recording_id: rid, segments_deleted: segCount ?? 0, speakers_deleted: spkCount ?? 0 }, 200, corsHeaders);
 });
 
+// BULK PURGE recordings by review_status — clear a stale backlog (e.g. wipe all
+// pending_review to restart a clean one-at-a-time drip). Speakers+segments cascade.
+// SAFETY: review_status is REQUIRED and must be an explicit known status — there is
+// no unfiltered "delete everything" path. Returns the ids removed. Pre-capture review
+// data only; no thoughts touched.
+app.post("/plaud-recordings/purge", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const status = body.review_status;
+  const ALLOWED = ["pending_review", "reviewed"];
+  if (!ALLOWED.includes(status)) {
+    return c.json({ error: `review_status is required and must be one of ${ALLOWED.join("|")} (no unfiltered purge)` }, 400, corsHeaders);
+  }
+  const { data: rows, error: selErr } = await supabase.from("plaud_recordings")
+    .select("recording_id").eq("review_status", status);
+  if (selErr) return c.json({ error: selErr.message }, 500, corsHeaders);
+  const ids = (rows ?? []).map((r) => r.recording_id);
+  if (ids.length === 0) return c.json({ deleted: 0, recording_ids: [], review_status: status }, 200, corsHeaders);
+  const { error: delErr } = await supabase.from("plaud_recordings").delete().eq("review_status", status);
+  if (delErr) return c.json({ error: delErr.message }, 500, corsHeaders);
+  return c.json({ deleted: ids.length, recording_ids: ids, review_status: status }, 200, corsHeaders);
+});
+
 // PATCH ONE segment: rename "just this instance" (diarization slip fix), set the
 // persistent `excluded` flag, and/or correct the transcript `text` (+ `text_edited`).
 // All fields optional; at least one required. Fields are independent — a rename PATCH
