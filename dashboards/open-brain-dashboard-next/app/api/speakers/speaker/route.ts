@@ -42,8 +42,10 @@ export async function PATCH(request: NextRequest) {
       {
         method: "PATCH",
         headers: { "x-brain-key": apiKey, "Content-Type": "application/json" },
-        // Ignore clears the OB label (untracked → shows as Speaker N) and un-enrols.
-        body: JSON.stringify({ resolved_name: name, enrolled: ignore ? false : doEnrol }),
+        // Ignore clears the OB label (untracked → shows as Speaker N), un-enrols, AND
+        // sets the whole-speaker `excluded` flag so the review LLM disregards their content.
+        // Naming a speaker re-includes them (excluded:false) — a named person is tracked.
+        body: JSON.stringify({ resolved_name: name, enrolled: ignore ? false : doEnrol, excluded: ignore }),
       }
     );
     if (!res.ok) throw new Error(`API ${res.status}`);

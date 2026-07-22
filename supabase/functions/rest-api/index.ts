@@ -4523,8 +4523,15 @@ app.patch("/plaud-recordings/:recording_id/speakers/:speaker_key", async (c) => 
   const body = await c.req.json().catch(() => ({}));
   const name = body.resolved_name === null ? null
     : (typeof body.resolved_name === "string" && body.resolved_name.trim() ? body.resolved_name.trim() : undefined);
-  if (name === undefined) return c.json({ error: "resolved_name (string) or null required" }, 400, corsHeaders);
-  const updates: Record<string, unknown> = { resolved_name: name, updated_at: new Date().toISOString() };
+  // excluded is the whole-speaker "disregard in analysis" flag (mirrors the per-segment
+  // excluded). Only written when a real boolean is sent, so a rename-only PATCH leaves it.
+  const excluded = typeof body.excluded === "boolean" ? body.excluded : undefined;
+  if (name === undefined && excluded === undefined) {
+    return c.json({ error: "resolved_name (string|null) or excluded (boolean) required" }, 400, corsHeaders);
+  }
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (name !== undefined) updates.resolved_name = name;
+  if (excluded !== undefined) updates.excluded = excluded;
   if (body.enrolled === true) updates.enrolled = true;
   const { data, error } = await supabase.from("plaud_recording_speakers")
     .update(updates).eq("recording_id", rid).eq("speaker_key", key).select("*").maybeSingle();

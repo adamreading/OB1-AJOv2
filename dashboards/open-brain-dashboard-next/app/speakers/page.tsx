@@ -18,6 +18,7 @@ type Speaker = {
   resolved_name: string | null;
   match_confidence: number | null;
   enrolled: boolean;
+  excluded?: boolean;       // whole-speaker "disregard in analysis" flag (set by "Ignore speaker")
 };
 type Segment = {
   recording_id: string;
@@ -233,7 +234,7 @@ function SpeakersInner() {
 
   // Stable "Speaker N" numbering from sorted distinct speaker keys.
   const speakerDisplay = useMemo(() => {
-    const map = new Map<string, { num: number; color: string; name: string | null; enrolled: boolean; confidence: number | null }>();
+    const map = new Map<string, { num: number; color: string; name: string | null; enrolled: boolean; confidence: number | null; excluded: boolean }>();
     if (!detail) return map;
     const keys = [...detail.speakers].sort((a, b) => a.speaker_key.localeCompare(b.speaker_key, undefined, { numeric: true }));
     keys.forEach((sp, i) => {
@@ -243,6 +244,7 @@ function SpeakersInner() {
         name: sp.resolved_name,
         enrolled: sp.enrolled,
         confidence: sp.match_confidence,
+        excluded: sp.excluded === true,
       });
     });
     return map;
@@ -460,12 +462,16 @@ function SpeakersInner() {
     finally { setPurging(false); }
   }, [filter, recordings.length, loadRecordings]);
 
+  // overflow-x-CLIP (not hidden): clips horizontal blow-out WITHOUT making the root a
+  // scroll container. `overflow-x:hidden` forces overflow-y:auto, which was breaking the
+  // detail pane's `sticky top-0` control panel (it stuck to this non-scrolling box and rode
+  // away with the page). clip keeps the mobile no-h-scroll guard AND restores sticky.
   return (
-    <div className="p-4 sm:p-6 max-w-[1400px] mx-auto overflow-x-hidden">
+    <div className="p-4 sm:p-6 max-w-[1400px] mx-auto overflow-x-clip">
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold">
-            Speakers <span className="text-xs font-normal opacity-50">build m8 · {recordings.length} loaded</span>
+            Speakers <span className="text-xs font-normal opacity-50">build m9 · {recordings.length} loaded</span>
           </h1>
           <p className="text-sm opacity-60">Review transcripts, confirm who spoke, enrol voices into the library.</p>
         </div>
@@ -565,11 +571,12 @@ function SpeakersInner() {
                   {[...speakerDisplay.entries()].map(([key, sp]) => (
                     <button key={key}
                       onClick={() => { setRenaming({ speakerKey: key, idx: null }); setRenameValue(sp.name || ""); }}
-                      className={`text-xs px-2 py-1 rounded-full border flex items-center gap-1.5 ${sp.name ? "" : "border-dashed"}`}
+                      className={`text-xs px-2 py-1 rounded-full border flex items-center gap-1.5 ${sp.name ? "" : "border-dashed"} ${sp.excluded ? "opacity-45 line-through decoration-1" : ""}`}
                       style={{ borderColor: sp.color, color: sp.color }}
-                      title={sp.name ? "Rename / re-enrol this speaker" : "Unknown speaker — tap to name + enrol"}>
+                      title={sp.excluded ? "Excluded speaker — every turn is disregarded in analysis. Tap to name (re-includes) or re-ignore." : (sp.name ? "Rename / re-enrol this speaker" : "Unknown speaker — tap to name + enrol")}>
                       <span className="w-2 h-2 rounded-full inline-block shrink-0" style={{ background: sp.color }} />
                       <span className="truncate max-w-[10rem]">{sp.name || `Speaker ${sp.num}`}</span>
+                      {sp.excluded && <span title="excluded from analysis" className="no-underline">⊘</span>}
                       {sp.enrolled && <span title="enrolled">◆</span>}
                       {sp.name ? (sp.confidence != null && <span className="opacity-50">{Math.round(sp.confidence * 100)}%</span>)
                                : <span className="opacity-70">· name?</span>}
@@ -587,7 +594,8 @@ function SpeakersInner() {
                   const sp = speakerDisplay.get(seg.speaker_key);
                   const color = sp?.color ?? "#888";
                   const isActive = activeIdx === seg.idx;
-                  const excluded = seg.excluded === true;                       // persistent manual/gated exclude
+                  const speakerExcluded = sp?.excluded === true;                // whole-speaker "ignored" → disregard every turn
+                  const excluded = seg.excluded === true || speakerExcluded;    // this turn OR its speaker is excluded
                   const mixed = !excluded && seg.overlap != null && seg.overlap >= OVERLAP_GATE;
                   const wontTeach = !excluded && seg.overlap != null && seg.overlap >= TEACH_GATE && seg.overlap < OVERLAP_GATE;
                   const unknown = !sp?.name;
@@ -631,8 +639,10 @@ function SpeakersInner() {
                             )}
                             {excluded && (
                               <span className="ml-2 align-[1px] whitespace-nowrap text-[10.5px] font-mono px-1.5 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/30"
-                                title="Excluded from voice identification — this turn won't teach the voice library (saved). Rename it to re-include.">
-                                ⊘ excluded
+                                title={speakerExcluded
+                                  ? "This speaker is ignored — every turn is disregarded in analysis (never attributed to them). Name the speaker to re-include."
+                                  : "Excluded from voice identification — this turn won't teach the voice library (saved). Rename it to re-include."}>
+                                ⊘ excluded{speakerExcluded && !(seg.excluded === true) ? " (speaker)" : ""}
                               </span>
                             )}
                             {mixed && (
@@ -704,7 +714,7 @@ function SpeakersInner() {
             </p>
             <div className="flex gap-2 justify-end flex-wrap">
               <button onClick={() => setRenaming(null)} className="text-xs px-3 py-1.5 rounded border border-white/15 opacity-70 hover:opacity-100">Cancel</button>
-              <button onClick={() => submitRename("ignore")} title={renaming.idx !== null ? "Exclude ONLY this line from voice identification (doesn't rename anyone or touch other lines)" : "Not someone you track — exclude this whole speaker; removes any voiceprint learned from their turns"} className="text-xs px-3 py-1.5 rounded border border-amber-500/30 text-amber-300/90 hover:bg-amber-500/10">
+              <button onClick={() => submitRename("ignore")} title={renaming.idx !== null ? "Exclude ONLY this line from voice identification (doesn't rename anyone or touch other lines)" : "Not someone you track — ignore this whole speaker: every turn is badged and DISREGARDED in analysis (never attributed to them), and any voiceprint learned from their turns is removed"} className="text-xs px-3 py-1.5 rounded border border-amber-500/30 text-amber-300/90 hover:bg-amber-500/10">
                 {renaming.idx !== null ? "Exclude this line" : "Ignore speaker"}
               </button>
               {renaming.idx !== null && (
