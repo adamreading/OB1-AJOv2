@@ -1189,6 +1189,15 @@ app.post("/review/approve", async (c) => {
   // Do NOT narrow this to "dashboard only" — that would wrongly refuse the operator's
   // intended the Hermes agent-in-DM escalation walk, which uses the same tool/endpoint.
   const humanAuthorized = body?.human_authorized === true || body?.human_authorized === "true";
+  // Stale-UPDATE guard override (added 2026-07-23): force-apply an UPDATE whose
+  // original_content snapshot no longer matches the target's current content
+  // (clobbers the intervening change; prior version is archived). Distinct from
+  // human_authorized ON PURPOSE — the dashboard /review walk always sets
+  // human_authorized, so reusing it would make the stale-guard a no-op from the UI.
+  // The caller must send force_stale_apply:true EXPLICITLY (i.e. Adam clicked
+  // "apply anyway" after seeing the staleness), otherwise a stale UPDATE is refused.
+  const forceStaleApply = body?.force_stale_apply === true || body?.force_stale_apply === "true";
+  const normContent = (s: unknown) => (typeof s === "string" ? s : "").replace(/\s+/g, " ").trim();
   if (!Array.isArray(ids) || ids.length === 0) {
     return c.json({ error: "ids array is required" }, 400);
   }
@@ -1241,6 +1250,30 @@ app.post("/review/approve", async (c) => {
 
       if (!targetBefore) {
         results.push({ id: serialId, action: "error", message: `UPDATE target #${targetSerialId} not found` });
+        continue;
+      }
+
+      // STALE-UPDATE GUARD (added 2026-07-23). The vessel body was merged by the
+      // analysis LLM against a snapshot of the target (metadata.original_content) at
+      // propose-time. If the target's CURRENT content has diverged from that snapshot,
+      // applying this OVERWRITE would clobber whatever changed the target since — e.g.
+      // the two-pending-UPDATEs-to-one-target collision (#426: #6229 & #6230), where
+      // approving the first makes the second's merge stale and its apply silently loses
+      // the first's additions. Refuse instead of clobber; the caller re-merges (or forces).
+      //   • EMPTY / absent snapshot  -> UNGUARDED, allow (legacy vessels + callers that
+      //     don't yet emit original_content; nothing to compare against). This is why the
+      //     existing #6229/#6230 vessels + a hand-combined #426 approval are NOT blocked.
+      //   • PRESENT + matches current -> safe, proceed.
+      //   • PRESENT + DIVERGED        -> refuse (action:"stale") unless force_stale_apply.
+      const snapshot = meta.original_content;
+      const haveSnapshot = typeof snapshot === "string" && snapshot.trim().length > 0;
+      if (haveSnapshot && normContent(snapshot) !== normContent(targetBefore.content) && !forceStaleApply) {
+        results.push({
+          id: serialId,
+          action: "stale",
+          target_id: targetSerialId,
+          message: `UPDATE is STALE: target #${targetSerialId} has changed since this merge was computed (its content no longer matches the vessel's original_content snapshot). Applying now would clobber the intervening change. Re-merge this vessel against the target's CURRENT content, or pass force_stale_apply:true to overwrite anyway (the prior version is archived to thought_versions and is revertible).`,
+        });
         continue;
       }
 
