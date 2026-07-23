@@ -18,7 +18,8 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const { ids } = (await request.json()) as { ids: number[] };
+    const parsed = (await request.json()) as { ids: number[]; force_stale_apply?: boolean };
+    const { ids } = parsed;
     if (!Array.isArray(ids) || ids.length === 0) {
       return NextResponse.json({ error: "No IDs provided" }, { status: 400 });
     }
@@ -28,10 +29,20 @@ export async function POST(request: NextRequest) {
     // approve escalations (escalate=true + escalation_status=open) from the review
     // walk — the server refuses those for automated callers (e.g. the
     // ob-curate-sweep cron) that don't set this flag.
+    // actor:"dashboard" feeds the approve-audit trail (review_actions) so an applied
+    // UPDATE / deleted vessel is attributable to the logged-in /review UI, not blank.
+    // force_stale_apply is passed THROUGH only when the client explicitly sends it (the
+    // future "apply anyway" affordance on a stale UPDATE); absent = the safe default,
+    // so a stale UPDATE is refused rather than clobbering.
     const res = await fetch(`${API_URL}/review/approve`, {
       method: "POST",
       headers: headers(apiKey),
-      body: JSON.stringify({ ids, human_authorized: true }),
+      body: JSON.stringify({
+        ids,
+        human_authorized: true,
+        actor: "dashboard",
+        ...(parsed.force_stale_apply === true ? { force_stale_apply: true } : {}),
+      }),
     });
     if (!res.ok) throw new Error(`API ${res.status}`);
     return NextResponse.json(await res.json());

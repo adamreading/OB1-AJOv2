@@ -1337,6 +1337,27 @@ app.post("/review/approve", async (c) => {
     }
   }
 
+  // Approve-audit trail (added 2026-07-23): one row per processed item, so an
+  // applied-UPDATE / deleted-vessel is answerable after the fact — the gap that
+  // left the #426 08:01 clobber actorless. Best-effort: a log failure must NEVER
+  // fail the approve. `actor` is a caller-supplied label (the dashboard proxy
+  // passes it from the logged-in session; autonomous callers pass their name or
+  // leave it null); human_authorized records whether the call was human-directed.
+  try {
+    const actor = typeof body?.actor === "string" && body.actor.trim() ? body.actor.trim() : null;
+    const auditRows = results.map((r) => ({
+      serial_id: typeof r.id === "number" ? r.id : null,
+      action: String(r.action ?? "unknown"),
+      target_id: typeof r.target_id === "number" ? r.target_id : null,
+      actor,
+      human_authorized: humanAuthorized,
+      meta:
+        r.message ? { message: r.message } :
+        (r.archived_prior_version != null ? { archived_prior_version: r.archived_prior_version } : null),
+    }));
+    if (auditRows.length) await supabase.from("review_actions").insert(auditRows);
+  } catch (_e) { /* audit is best-effort — never block the approve on a log error */ }
+
   return c.json({ results }, 200, corsHeaders);
 });
 
