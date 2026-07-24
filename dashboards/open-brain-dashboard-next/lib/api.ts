@@ -152,9 +152,17 @@ export async function dismissDuplicate(
 
 export async function deleteThought(
   apiKey: string,
-  id: number
+  id: number,
+  // Every caller of this fn is a dashboard UI action behind requireSession() — i.e. the
+  // logged-in operator clicking a button. So default human_authorized:true, which the
+  // rest-api DELETE /thought/:id reads to permit deleting a HELD escalation (escalate=true
+  // + escalation_status=open). Without it the server fail-closes with 409 (a guard aimed at
+  // AUTONOMOUS curate crons — those hit REST directly, NOT this lib, so the guard still bites
+  // where it should). Same human-directed assertion /review/approve already makes. Pass
+  // false only from a genuinely non-human/automated path (none today).
+  humanAuthorized: boolean = true
 ): Promise<void> {
-  const url = `${API_URL}/thought/${id}`;
+  const url = `${API_URL}/thought/${id}${humanAuthorized ? "?human_authorized=true" : ""}`;
   const res = await fetch(url, {
     method: "DELETE",
     headers: headers(apiKey),
