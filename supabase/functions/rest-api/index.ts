@@ -4363,7 +4363,11 @@ app.post("/plaud-recordings", async (c) => {
     started_at: body.started_at ?? null,
     duration_ms: Number.isFinite(Number(body.duration_ms)) ? Number(body.duration_ms) : null,
     audio_ref: typeof body.audio_ref === "string" ? body.audio_ref : null,
-    transcript_text: typeof body.transcript_text === "string" ? body.transcript_text : null,
+    // transcript_text intentionally NOT written — the per-segment `text` rows in
+    // plaud_speaker_segments are the source of truth; storing the full concatenated
+    // transcript here again was a redundant second copy (dead ~60KB blob nothing
+    // reads). Column is kept (existing rows untouched, reversible) but no longer
+    // populated on new ingests. Coordinated with the WSL plaud-side change (both halves).
     review_status: body.review_status === "reviewed" ? "reviewed" : "pending_review",
     metadata: (body.metadata && typeof body.metadata === "object") ? body.metadata : {},
     updated_at: new Date().toISOString(),
@@ -4447,8 +4451,12 @@ app.get("/plaud-recordings", async (c) => {
 // DETAIL — recording + its speakers + ordered segments.
 app.get("/plaud-recordings/:recording_id", async (c) => {
   const rid = c.req.param("recording_id");
+  // Explicit column list (NOT select("*")) so the ~60KB transcript_text blob — which
+  // no consumer reads (the GUI renders segments; wsl's analyzer reconstructs from them)
+  // — is never shipped as dead egress. Add a column here if a future reader needs it.
   const { data: rec, error: recErr } = await supabase.from("plaud_recordings")
-    .select("*").eq("recording_id", rid).maybeSingle();
+    .select("id, recording_id, title, started_at, duration_ms, audio_ref, review_status, summary_md, metadata, created_at, updated_at")
+    .eq("recording_id", rid).maybeSingle();
   if (recErr) return c.json({ error: recErr.message }, 500, corsHeaders);
   if (!rec) return c.json({ error: "recording not found" }, 404, corsHeaders);
   const { data: speakers } = await supabase.from("plaud_recording_speakers")
