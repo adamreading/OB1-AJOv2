@@ -12,6 +12,14 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// All agent_memories columns EXCEPT the 1536-dim `embedding` vector. This function's
+// reads route through the PUBLIC /rest/v1 gateway (billed as PostgREST egress), so
+// select("*") shipped ~15KB of embedding per row on every read — the amplifier behind
+// the 2026-07-27 egress spike (mirrors THOUGHT_COLS in rest-api). The vector match is
+// done server-side in the match_agent_memories RPC; no read consumer needs the raw
+// vector back (responseMemory/rankMemory/scopeMatches never reference it).
+const AGENT_MEMORY_COLS = "id, thought_id, workspace_id, project_id, channel_kind, channel_id, channel_thread_id, visibility, memory_type, summary, content, lifecycle_status, provenance_status, confidence, created_by, runtime_name, runtime_version, provider, model, task_id, flow_id, can_use_as_instruction, can_use_as_evidence, requires_user_confirmation, review_status, last_confirmed_at, stale_after, idempotency_key, content_hash, metadata, created_at, updated_at, authority_subtype";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key",
@@ -413,7 +421,7 @@ app.post("/recall", async (c) => {
 
   let memoryQuery = supabase
     .from("agent_memories")
-    .select("*")
+    .select(AGENT_MEMORY_COLS)
     .eq("workspace_id", req.workspace_id)
     .order("created_at", { ascending: false })
     .limit(100);
@@ -625,7 +633,7 @@ app.get("/memories/review", async (c) => {
   const workspace_id = c.req.query("workspace_id");
   if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
   const project_id = c.req.query("project_id");
-  let q = supabase.from("agent_memories").select("*").eq("workspace_id", workspace_id).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
+  let q = supabase.from("agent_memories").select(AGENT_MEMORY_COLS).eq("workspace_id", workspace_id).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
   if (project_id) q = q.eq("project_id", project_id);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
@@ -639,7 +647,7 @@ app.get("/memories", async (c) => {
   const limit = Math.min(Math.max(parseInt(c.req.query("limit") || "50", 10), 1), 200);
   let q = supabase
     .from("agent_memories")
-    .select("*")
+    .select(AGENT_MEMORY_COLS)
     .eq("workspace_id", workspace_id)
     .order("created_at", { ascending: false })
     .limit(limit);
@@ -671,7 +679,7 @@ app.post("/memories/review", async (c) => {
   const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
   const workspace_id = body.workspace_id as string | undefined;
   if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
-  let q = supabase.from("agent_memories").select("*").eq("workspace_id", workspace_id).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
+  let q = supabase.from("agent_memories").select(AGENT_MEMORY_COLS).eq("workspace_id", workspace_id).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
   if (body.project_id) q = q.eq("project_id", body.project_id as string);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
@@ -686,7 +694,7 @@ app.post("/memories/list", async (c) => {
   const limit = Math.min(Math.max(parseInt(String(body.limit ?? "50"), 10) || 50, 1), 200);
   let q = supabase
     .from("agent_memories")
-    .select("*")
+    .select(AGENT_MEMORY_COLS)
     .eq("workspace_id", workspace_id)
     .order("created_at", { ascending: false })
     .limit(limit);
