@@ -158,25 +158,43 @@ function SpeakersInner() {
   // Transcript summary panel (terra-generated markdown, shown for reviewed recordings).
   const [showSummary, setShowSummary] = useState(false);
 
+  // Poll hardening (added during the 2026-07-27 DB disk-IO incident): an in-flight
+  // guard + fetch timeout stop the 30s list poll from piling up hanging requests
+  // against a wedged DB (that pile-up was a source of the plaud_recordings request
+  // storm), and consecutive failures back the cadence off (see the poll effect).
+  const pollInFlight = useRef(false);
+  const pollFailures = useRef(0);
+
   const loadRecordings = useCallback(async (which: "pending" | "reviewed" | "all" = filter) => {
+    // Never stack a second list fetch on top of a pending one — one at a time.
+    if (pollInFlight.current) return [];
+    pollInFlight.current = true;
     const qs = which === "all" ? "" : `?review_status=${which === "reviewed" ? "reviewed" : "pending_review"}`;
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 15000); // don't hold a hung request open
     try {
-      const res = await fetch(`/api/speakers${qs}`);
+      const res = await fetch(`/api/speakers${qs}`, { signal: ctrl.signal });
       if (!res.ok) {
+        pollFailures.current++;
         setStatus(`List load failed (${res.status}) — will retry`);
         return [];
       }
       const j = await res.json();
+      pollFailures.current = 0;
       setRecordings(j.recordings ?? []);
       setStatus((s) => (s.startsWith("Couldn't reach") || s.startsWith("List load failed") ? "" : s));
       return j.recordings ?? [];
     } catch (e) {
-      // Network error ("Failed to fetch") — e.g. the server was momentarily down
-      // (a restart) or the connection blipped. Do NOT clear the list; surface a
-      // retry note and let the 30s poll recover. Previously this threw unhandled
-      // and left the list permanently empty.
+      // Network error / abort — e.g. the server was momentarily down (a restart),
+      // the connection blipped, or our 15s timeout fired against a wedged backend.
+      // Do NOT clear the list; surface a retry note and let the backing-off poll
+      // recover. Previously this threw unhandled and left the list empty.
+      pollFailures.current++;
       setStatus(`Couldn't reach server — retrying (${e instanceof Error ? e.message : "network error"})`);
       return [];
+    } finally {
+      clearTimeout(timeout);
+      pollInFlight.current = false;
     }
   }, [filter]);
 
@@ -211,9 +229,21 @@ function SpeakersInner() {
   // ingested after the page opened appear without a manual reload (the original
   // bug: the list loaded once on mount and never saw new recordings).
   useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => {
+      // Base 30s; back off toward ~5min while the server is unreachable so a
+      // wedged DB isn't hammered by a fixed-cadence poll (2026-07-27 incident).
+      const delay = 30000 * Math.min(1 + pollFailures.current, 10);
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        await loadRecordings(filter);
+        if (!cancelled) schedule();
+      }, delay);
+    };
     loadRecordings(filter);
-    const t = setInterval(() => loadRecordings(filter), 30000);
-    return () => clearInterval(t);
+    schedule();
+    return () => { cancelled = true; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter]);
 

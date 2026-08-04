@@ -132,13 +132,21 @@ export function EngineBoard() {
   const [receipts, setReceipts] = useState<Receipt[] | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [busy, setBusy] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const inFlight = useRef(false);
+  const fails = useRef(0);
 
   const load = useCallback(async () => {
+    // In-flight guard + timeout + failure backoff (added 2026-07-27, same class as
+    // the /speakers pile-up): against a wedged DB an unguarded 15s poll stacks two
+    // hanging fetches per tick. Single-flight + a sub-interval timeout prevent it.
+    if (inFlight.current) return;
+    inFlight.current = true;
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 12000); // < 15s poll interval
     try {
       const [tRes, lRes] = await Promise.all([
-        fetch("/api/engine/tasks?limit=200"),
-        fetch("/api/engine/ledger"),
+        fetch("/api/engine/tasks?limit=200", { signal: ctrl.signal }),
+        fetch("/api/engine/ledger", { signal: ctrl.signal }),
       ]);
       if (tRes.ok) {
         const d = await tRes.json();
@@ -152,17 +160,32 @@ export function EngineBoard() {
         setLedger(d.ledger ?? []);
       }
       setLastFetch(new Date());
+      fails.current = 0;
     } catch (e) {
+      fails.current++;
       setError(e instanceof Error ? e.message : "fetch failed");
+    } finally {
+      clearTimeout(timeout);
+      inFlight.current = false;
     }
   }, []);
 
   useEffect(() => {
-    load();
-    pollRef.current = setInterval(load, 15000);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => {
+      // 15s base, backing off toward ~2.5min while the server is unreachable so a
+      // wedged DB isn't hammered by a fixed-cadence poll (2026-07-27 incident class).
+      const delay = 15000 * Math.min(1 + fails.current, 10);
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        await load();
+        if (!cancelled) schedule();
+      }, delay);
     };
+    load();
+    schedule();
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [load]);
 
   // Load receipt thread when a task is selected
