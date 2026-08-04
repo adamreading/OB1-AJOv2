@@ -2087,7 +2087,7 @@ app.post("/entities", async (c) => {
     }
   }
 
-  const normalizedName = canonicalName.toLowerCase().trim().replace(/\s+/g, " ");
+  const normalizedName = normalizedNameKey(canonicalName);
   const providedAliases: string[] = Array.isArray(body.aliases)
     ? body.aliases.filter((a: unknown) => typeof a === "string" && a.trim()).map((a: string) => a.trim())
     : [];
@@ -2374,11 +2374,43 @@ app.patch("/entities/:id/aliases", async (c) => {
   }, 200, corsHeaders);
 });
 
+// ── Canonical name-key derivation — SINGLE fold for this function ────────────
+// Smart apostrophes (U+2018 ‘, U+2019 ’, U+02BC ʼ) fold to the straight ASCII
+// U+0027 ' as the FIRST step of EVERY place a name becomes a key: normalized_name
+// (entity-creation + rename dedup), looseNormalize (absorb match), and slug
+// derivation. Without this, a curly and a straight variant of the same name mint
+// SEPARATE entities at creation AND SEPARATE wiki pages (e.g. "Foo’s" vs "Foo's"
+// → two entity rows AND two slugs foo-s / foos for one thing).
+// The IDENTICAL fold-then-existing-rules contract MUST also live in
+// recipes/entity-wiki/generate-wiki.mjs slugify() and in the agent-side page +
+// entity derivation (separate Python runtime — slug derivation AND the entity
+// normalized_name dedup key). It is cross-language, so it cannot be a shared
+// import — the spec is the source of truth: fold [‘’ʼ] → U+0027, then apply the
+// existing rules.
+function foldApostrophes(s: string): string {
+  return String(s || "").replace(/[‘’ʼ]/g, "'");
+}
+// entity dedup key (stored as entities.normalized_name; keeps the apostrophe,
+// keeps hyphens — only folds smart→straight + lowercases + collapses whitespace).
+function normalizedNameKey(name: string): string {
+  return foldApostrophes(name).toLowerCase().trim().replace(/\s+/g, " ");
+}
+// wiki slug: `${type}-${alnum-hyphenated}`. Apostrophes (now straight) fall to a
+// hyphen via the [^a-z0-9]+ run, so both variants derive one deterministic slug.
+function slugifyName(name: string, entityType: string): string {
+  const base = foldApostrophes(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${entityType}-${base}`;
+}
+
 // Loose normalization used for alias-driven duplicate detection. Stricter than
 // `normalized_name` (which keeps hyphens) — collapses any of [-_ ] runs to a
-// single space so "EU-locked Gemini" and "EU Locked Gemini" match.
+// single space so "EU-locked Gemini" and "EU Locked Gemini" match. Folds smart
+// apostrophes first so "Foo’s" and "Foo's" collapse to one absorb key.
 function looseNormalize(s: string): string {
-  return String(s || "")
+  return foldApostrophes(s)
     .toLowerCase()
     .trim()
     .replace(/[\s\-_]+/g, " ")
@@ -2620,7 +2652,7 @@ app.patch("/entities/:id", async (c) => {
   if (current) {
     const effectiveType = newType || current.entity_type;
     const effectiveName = newName
-      ? newName.toLowerCase().trim().replace(/\s+/g, " ")
+      ? normalizedNameKey(newName)
       : current.normalized_name;
     await absorbDuplicate(effectiveType, effectiveName);
   }
@@ -2628,7 +2660,7 @@ app.patch("/entities/:id", async (c) => {
   const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if (newName) {
     updates.canonical_name = newName;
-    updates.normalized_name = newName.toLowerCase().trim().replace(/\s+/g, " ");
+    updates.normalized_name = normalizedNameKey(newName);
   }
   if (newType) updates.entity_type = newType;
 
@@ -2647,7 +2679,7 @@ app.patch("/entities/:id", async (c) => {
     if (wikiPage) {
       const effType = newType || current?.entity_type || "entity";
       const effName = newName || current?.canonical_name || wikiPage.title || "";
-      const newSlug = `${effType}-${effName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")}`;
+      const newSlug = slugifyName(effName, effType);
       const wikiUpdate: Record<string, unknown> = { updated_at: new Date().toISOString() };
       if (newName) wikiUpdate.title = newName;
       if (newType) wikiUpdate.metadata = { ...(wikiPage.metadata as object ?? {}), entity_type: newType };

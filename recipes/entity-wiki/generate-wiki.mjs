@@ -814,8 +814,17 @@ function keepLastDraft(text) {
 // Output modes
 // ---------------------------------------------------------------
 
+// Smart apostrophes (U+2018 ‘, U+2019 ’, U+02BC ʼ) fold to straight U+0027 FIRST
+// so "Foo’s" (curly) and "Foo's" (straight) derive ONE deterministic slug (else
+// they diverge to foo-s / foos and mint two pages for one entity). Same
+// fold-then-existing-rules contract as rest-api slugifyName() and the agent-side
+// page-authoring derivation (separate runtime) — cross-language, so it is a spec
+// not a shared import.
+function foldApostrophes(name) {
+  return String(name).replace(/[‘’ʼ]/g, "'");
+}
 function slugify(name, entityType) {
-  const base = String(name)
+  const base = foldApostrophes(name)
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
