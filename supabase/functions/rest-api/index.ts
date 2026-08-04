@@ -2420,6 +2420,21 @@ async function enqueueSurvivorRebuild(survivorId: number, reason: string): Promi
   return false;
 }
 
+// Carry a merged-away (loser) entity's curator notes onto the survivor BEFORE the loser
+// page is deleted (2026-08-02 follow-up). Notes are the highest-authority regen steering;
+// the rebuild PROSE is fresh (Adam accepted that on a merge) but the human's notes should
+// survive. Has-page survivor: append. Page-less survivor: nowhere to put notes yet, so the
+// rebuild authors fresh — a documented limitation matching the accepted merge content loss.
+async function carryNotesToSurvivor(loserId: number, survivorId: number): Promise<void> {
+  const { data: loserPg } = await supabase.from("wiki_pages").select("notes").eq("entity_id", loserId).maybeSingle();
+  const loserNotes = String(loserPg?.notes ?? "").trim();
+  if (!loserNotes) return;
+  const { data: survPg } = await supabase.from("wiki_pages").select("notes").eq("entity_id", survivorId).maybeSingle();
+  if (!survPg) return; // page-less survivor: no page to hold notes; rebuild authors fresh.
+  const merged = [String(survPg.notes ?? "").trim(), loserNotes].filter(Boolean).join("\n\n");
+  await supabase.from("wiki_pages").update({ notes: merged }).eq("entity_id", survivorId);
+}
+
 // Find any other entity whose canonical_name OR any of its aliases looses-
 // matches the given name, and absorb each one into `survivorId`. Returns the
 // list of absorbed entities so the caller can report them.
@@ -2503,6 +2518,7 @@ async function absorbDuplicatesByName(
       }
     }
 
+    await carryNotesToSurvivor(dupe.id, survivorId);
     await supabase.from("wiki_pages").delete().eq("entity_id", dupe.id);
     await supabase.from("entities").delete().eq("id", dupe.id);
   }
@@ -2591,6 +2607,7 @@ app.patch("/entities/:id", async (c) => {
       if (!dup) await supabase.from("edges").update({ to_entity_id: id }).eq("id", edge.id);
       else await supabase.from("edges").delete().eq("id", edge.id);
     }
+    await carryNotesToSurvivor(dupe.id, id);
     await supabase.from("wiki_pages").delete().eq("entity_id", dupe.id);
     await supabase.from("entities").delete().eq("id", dupe.id);
     // GUARANTEED survivor rebuild (merge-orphan fix, 2026-08-02).
@@ -3751,7 +3768,10 @@ app.put("/wiki-pages/:slug", async (c) => {
   const now = new Date().toISOString();
   const fields: Record<string, unknown> = {
     content: body.content,
-    manually_edited: true,
+    // manually_edited defaults TRUE (a dashboard human edit omits it = protected). A
+    // machine author (ob_drain's regen PUT) sends manually_edited:false so its pages are
+    // sweepable — making the flag mean "human-edited" for the first time (was always true).
+    manually_edited: (typeof body.manually_edited === "boolean") ? body.manually_edited : true,
     updated_at: now,
     generated_at: now,
   };
@@ -4366,6 +4386,7 @@ app.post("/entities/:id/merge", async (c) => {
   // ── delete source wiki page + entity; mark target's page stale + queue regen
   const { data: srcPages } = await supabase
     .from("wiki_pages").select("slug").eq("entity_id", sourceId);
+  await carryNotesToSurvivor(sourceId, targetId);
   await supabase.from("wiki_pages").delete().eq("entity_id", sourceId);
   await supabase.from("entities").delete().eq("id", sourceId);
   // GUARANTEED survivor rebuild — enqueue whether or not the survivor currently has a
