@@ -2477,9 +2477,23 @@ async function absorbDuplicatesByName(
   const target = looseNormalize(matchName);
   if (!target) return [];
 
-  // Pull a candidate set: any entity whose canonical_name OR alias contains the
-  // first significant word of the match (cheap pre-filter via ilike), then
-  // verify with full loose normalization in JS.
+  // entity_type GUARD (2026-08-04): an alias-add absorb must NEVER cross entity
+  // types. Without this, adding alias "Foo" to a PERSON would also absorb an
+  // ORGANIZATION loosely-named "Foo" — a silent, near-unrecoverable over-merge
+  // (moves thought_entities + edges, deletes the loser). looseNormalize is looser
+  // than the creation key (folds -/_ to space), so it can bridge two entities that
+  // creation kept as distinct rows — a hyphen-vs-space pair of different types is
+  // the real vector. Same-type only; a genuine cross-type merge is the explicit
+  // POST /entities merge, never an alias side effect. (The rename-path
+  // absorbDuplicate() already filters entity_type.)
+  const { data: survivor } = await supabase
+    .from("entities").select("entity_type").eq("id", survivorId).maybeSingle();
+  if (!survivor) return [];
+  const survivorType = survivor.entity_type;
+
+  // Pull a candidate set: any entity of the SAME type whose canonical_name OR
+  // alias contains the first significant word of the match (cheap pre-filter via
+  // ilike), then verify with full loose normalization in JS.
   const word = target.split(" ").reduce((longest, w) =>
     w.length > longest.length ? w : longest, ""
   );
@@ -2488,12 +2502,16 @@ async function absorbDuplicatesByName(
   const { data: candidates } = await supabase
     .from("entities")
     .select("id, canonical_name, aliases, entity_type")
+    .eq("entity_type", survivorType)
     .neq("id", survivorId)
     .or(`canonical_name.ilike.%${word}%,aliases.cs.{${word}}`)
     .limit(50);
 
   const matches: AbsorbedEntity[] = [];
   for (const c of candidates || []) {
+    // Defensive: the query already filters entity_type, but never absorb across
+    // type even if that filter is ever relaxed.
+    if (c.entity_type !== survivorType) continue;
     if (looseNormalize(c.canonical_name) === target) {
       matches.push({ id: c.id, canonical_name: c.canonical_name, aliases: c.aliases ?? [] });
       continue;
