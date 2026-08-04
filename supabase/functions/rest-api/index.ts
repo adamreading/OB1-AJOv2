@@ -2391,6 +2391,35 @@ interface AbsorbedEntity {
   aliases: string[];
 }
 
+// Guaranteed survivor rebuild on merge (fix for the merge-orphan bug, 2026-08-02).
+// After a merge deletes the LOSER's page, the SURVIVOR must ALWAYS get a rebuild
+// queued — page-less survivors author fresh; paged survivors regen in place at their
+// existing slug (claim RPC coalesces slug). eligible_at = +5min debounce so a human can
+// finish curating; a further change in the window bumps it (coalesced by the
+// wiki_regen_active_uq partial index). The old code only marked an EXISTING survivor
+// page stale — a no-op when the survivor had none, which is exactly how the orphans formed.
+async function enqueueSurvivorRebuild(survivorId: number, reason: string): Promise<boolean> {
+  const eligibleAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const { data: pg } = await supabase.from("wiki_pages").select("slug").eq("entity_id", survivorId).maybeSingle();
+  const { error } = await supabase.from("wiki_regen_queue").insert({
+    entity_id: survivorId,
+    slug: pg?.slug ?? null,        // null => ob_drain derives the canonical slug (page-less survivor)
+    requested_by: "entity-merge",
+    reason,
+    eligible_at: eligibleAt,
+  });
+  if (!error) return true;
+  if ((error as { code?: string }).code === "23505") {
+    // active row already exists — coalesce + bump the debounce window.
+    await supabase.from("wiki_regen_queue")
+      .update({ eligible_at: eligibleAt })
+      .eq("entity_id", survivorId)
+      .in("status", ["pending", "processing"]);
+    return true;
+  }
+  return false;
+}
+
 // Find any other entity whose canonical_name OR any of its aliases looses-
 // matches the given name, and absorb each one into `survivorId`. Returns the
 // list of absorbed entities so the caller can report them.
@@ -2486,6 +2515,10 @@ async function absorbDuplicatesByName(
   //      regenerates everything but this lets a partial-regen script
   //      filter to "needs_regen" pages and act fast.
   if (matches.length > 0) {
+    // GUARANTEED survivor rebuild (merge-orphan fix, 2026-08-02): always queue, even if
+    // the survivor currently has no page. The mark-stale below is a no-op for page-less
+    // survivors — this is not.
+    await enqueueSurvivorRebuild(survivorId, "absorbed duplicate(s) by name");
     const { data: link } = await supabase
       .from("thought_entities")
       .select("thought_id")
@@ -2560,6 +2593,8 @@ app.patch("/entities/:id", async (c) => {
     }
     await supabase.from("wiki_pages").delete().eq("entity_id", dupe.id);
     await supabase.from("entities").delete().eq("id", dupe.id);
+    // GUARANTEED survivor rebuild (merge-orphan fix, 2026-08-02).
+    await enqueueSurvivorRebuild(id, `absorbed invisible duplicate #${dupe.id} on rename/retype`);
   }
 
   const { data: current } = await supabase
@@ -3731,11 +3766,16 @@ app.put("/wiki-pages/:slug", async (c) => {
   // stale rename-orphans — delete them so it's always one page per entity.
   const supersede = async (entityId: number | null, keepSlug: string): Promise<string[]> => {
     if (entityId == null) return [];
+    // Delete ONLY non-manually_edited other-slug pages. A hand-edited page is NEVER
+    // destroyed as a side effect (2026-08-02): if a regen derives a different slug from a
+    // deliberate human-chosen one the derivation cannot reproduce, BOTH stay live and the
+    // wiki-hygiene sweep flags the duplicate for a human — never-destroy beats never-duplicate.
     const { data: others } = await supabase
-      .from("wiki_pages").select("slug").eq("entity_id", entityId).neq("slug", keepSlug);
-    const slugs = (others ?? []).map((o: { slug: string }) => o.slug);
-    if (slugs.length) await supabase.from("wiki_pages").delete().eq("entity_id", entityId).neq("slug", keepSlug);
-    return slugs;
+      .from("wiki_pages").select("slug, manually_edited").eq("entity_id", entityId).neq("slug", keepSlug);
+    const deletable = (others ?? []).filter((o: { manually_edited?: boolean }) => !o.manually_edited)
+      .map((o: { slug: string }) => o.slug);
+    if (deletable.length) await supabase.from("wiki_pages").delete().eq("entity_id", entityId).in("slug", deletable);
+    return deletable;
   };
 
   if (existing) {
@@ -3803,6 +3843,16 @@ app.post("/wiki-pages/:slug/regen", async (c) => {
     regen_id: row?.id,
     message: "Queued for regeneration — the Hermes agent authors it on his next drain pass.",
   }, 200, corsHeaders);
+});
+
+// Wiki-layer hygiene: every entity + link_count + page info in ONE read-only call
+// (entities_hygiene() returns a single jsonb_agg row, bypassing the 1000-row cap).
+// Backs the 48h ob_wiki_hygiene sweep; count == full entities table by construction.
+app.get("/entities/hygiene", async (c) => {
+  const { data, error } = await supabase.rpc("entities_hygiene");
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  const entities = Array.isArray(data) ? data : [];
+  return c.json({ entities, count: entities.length }, 200, corsHeaders);
 });
 
 // wiki_regen_queue consumer surface (same semantics as /extraction-queue).
@@ -4318,15 +4368,11 @@ app.post("/entities/:id/merge", async (c) => {
     .from("wiki_pages").select("slug").eq("entity_id", sourceId);
   await supabase.from("wiki_pages").delete().eq("entity_id", sourceId);
   await supabase.from("entities").delete().eq("id", sourceId);
-  let regenQueued = false;
-  const { data: tgtPage } = await supabase
-    .from("wiki_pages").select("slug").eq("entity_id", targetId).maybeSingle();
-  if (tgtPage) {
-    await supabase.from("wiki_pages").update({ generated_at: null }).eq("entity_id", targetId);
-    const { error: regenErr } = await supabase.from("wiki_regen_queue")
-      .insert({ entity_id: targetId, slug: tgtPage.slug, requested_by: "entity-merge", reason: `absorbed #${sourceId} ${source.canonical_name}` });
-    regenQueued = !regenErr; // 23505 = already queued; fine
-  }
+  // GUARANTEED survivor rebuild — enqueue whether or not the survivor currently has a
+  // page. Page-less survivors author fresh; this is the merge-orphan fix (2026-08-02).
+  // The old code only queued when the survivor already had a page, which is how a merge
+  // onto a page-less survivor left nothing behind.
+  const regenQueued = await enqueueSurvivorRebuild(targetId, `absorbed #${sourceId} ${source.canonical_name}`);
 
   return c.json({
     merged: true, source_id: sourceId, target_id: targetId,
