@@ -22,7 +22,11 @@ export async function GET(request: NextRequest) {
 
   const sp = new URLSearchParams({
     review_status: "pending_review",
-    source_type: "plaud",
+    // NOTE (2026-08-05): select the review queue by review_status ALONE — do NOT filter
+    // source_type=plaud. The queue is "everything pending human review", regardless of who
+    // wrote it. The old source_type=plaud filter was load-bearing only because MCP writes
+    // were mislabelled "plaud" (open-brain-mcp :438/:531); once that hardcode is fixed to the
+    // true mcp-<name> source, a source_type filter here would hide those vessels. Decoupled.
     per_page: "50",
     page,
     // This is the logged-in human review surface — it MUST see held escalations so the

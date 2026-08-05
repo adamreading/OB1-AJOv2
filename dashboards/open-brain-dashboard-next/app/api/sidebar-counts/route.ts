@@ -40,7 +40,7 @@ export async function GET() {
       apiKey
     ),
     jsonOrNull(
-      `${API_URL}/thoughts?review_status=pending_review&source_type=plaud&per_page=1`,
+      `${API_URL}/thoughts?review_status=pending_review&per_page=1`,
       apiKey
     ),
     jsonOrNull(

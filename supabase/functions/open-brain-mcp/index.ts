@@ -435,7 +435,7 @@ function createServer(): McpServer {
               importance: 3,
               quality_score: 50,
               classification: resolvedClassification,
-              source_type: "plaud",
+              source_type: finalSource,
               content_fingerprint: fp,
               metadata: meta,
             })
@@ -508,6 +508,10 @@ function createServer(): McpServer {
           const currentClass = current.classification || (current.metadata as Record<string, unknown> | null)?.classification;
           const classificationDefault = resolvedType === "newsletter" ? "personal" : (currentClass || "work");
           const resolvedClassification = (classification === "work" || classification === "personal") ? classification : classificationDefault;
+          // TRUE provenance: the real client, not a hardcoded "plaud". Used for BOTH
+          // metadata.source and source_type below (2026-08-05 provenance fix). The dashboard
+          // /review queue now selects by review_status alone, so this no longer hides vessels.
+          const finalSource = source ? `mcp-${source}` : "mcp";
 
           const meta: Record<string, unknown> = {
             content_fingerprint: fp,
@@ -515,7 +519,7 @@ function createServer(): McpServer {
             ollama_decision: "UPDATE",
             update_target_id: current.serial_id,
             original_content: current.content,
-            source: source ? `mcp-${source}` : "mcp",
+            source: finalSource,
             classification: resolvedClassification,
           };
 
@@ -528,7 +532,7 @@ function createServer(): McpServer {
               importance: 3,
               quality_score: 50,
               classification: resolvedClassification,
-              source_type: "plaud",
+              source_type: finalSource,
               content_fingerprint: fp,
               metadata: meta,
             })
