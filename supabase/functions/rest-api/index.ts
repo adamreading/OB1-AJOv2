@@ -4134,7 +4134,7 @@ app.get("/context-brief", async (c) => {
 
 const AGENT_TASK_KINDS = ["standing", "task", "standing_skill"];
 const AGENT_TASK_STATUSES = ["standing", "todo", "working", "needs_input", "review", "done"];
-const AGENT_RECEIPT_TYPES = ["CLAIMED", "DONE", "BLOCKED", "UNBLOCKED", "HUMAN_HOLD", "HUMAN_ANSWERED", "RESUMED", "FAILED", "APPLIED", "FOLLOW_UP"];
+const AGENT_RECEIPT_TYPES = ["CLAIMED", "DONE", "BLOCKED", "UNBLOCKED", "HUMAN_HOLD", "HUMAN_ANSWERED", "RESUMED", "FAILED", "APPLIED", "FOLLOW_UP", "TEXT_REPLACED"];
 
 // List tasks. agent_code matches the code OR 'all'-assigned tasks.
 app.get("/agent-tasks", async (c) => {
@@ -4221,6 +4221,32 @@ app.patch("/agent-tasks/:id", async (c) => {
     updates.status_updated_at = new Date().toISOString();
     if (body.status === "done" || body.status === "todo") { updates.claimed_by = null; updates.claimed_at = null; }
   }
+  // TEXT-PROTECTION GUARD (2026-08-06): title/body can hold the requester's OWN words, so a
+  // PATCH that REPLACES an existing non-empty title/body is refused by default — send a
+  // correction as a receipt (receipt_type + receipt_body), or pass allow_text_overwrite:true
+  // to force. On a forced overwrite the prior text is preserved verbatim in a TEXT_REPLACED
+  // receipt (below). Ports the guard already on the Ringer engine; closes the silent-destroy
+  // (brief-13) class on the OB host. Operational fields (blocked_reason/hold_reason/
+  // local_context_version) are NOT protected — only the words fields.
+  let priorText: Record<string, string> | null = null;
+  if (["title", "body"].some((f) => typeof body[f] === "string" || body[f] === null)) {
+    const { data: cur } = await supabase.from("agent_tasks").select("title, body").eq("id", id).maybeSingle();
+    if (!cur) return c.json({ error: "task not found" }, 404, corsHeaders);
+    const clobbers: string[] = [];
+    for (const f of ["title", "body"] as const) {
+      const incoming = (body as Record<string, unknown>)[f];
+      if ((typeof incoming === "string" || incoming === null) && cur[f] && String(cur[f]).trim() && incoming !== cur[f]) {
+        clobbers.push(f);
+      }
+    }
+    if (clobbers.length && body.allow_text_overwrite !== true) {
+      return c.json({
+        error: `refused: this would OVERWRITE existing ${clobbers.join(" + ")} (destructive, no undo). Send the correction as a receipt (receipt_type + receipt_body), or pass allow_text_overwrite:true to force — the prior text is receipted either way.`,
+        protected_fields: clobbers,
+      }, 409, corsHeaders);
+    }
+    if (clobbers.length) priorText = Object.fromEntries(clobbers.map((f) => [f, String(cur[f])]));
+  }
   for (const f of ["title", "body", "blocked_reason", "hold_reason", "local_context_version"]) {
     if (typeof body[f] === "string" || body[f] === null) updates[f] = body[f];
   }
@@ -4236,6 +4262,14 @@ app.patch("/agent-tasks/:id", async (c) => {
   const { data, error } = await supabase.from("agent_tasks").update(updates).eq("id", id).select("*").maybeSingle();
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
   if (!data) return c.json({ error: "task not found" }, 404, corsHeaders);
+  // Preserve the prior words verbatim when a forced overwrite (allow_text_overwrite) actually
+  // replaced title/body — best-effort, never fails the write (same posture as review_actions).
+  if (priorText) {
+    await supabase.from("agent_task_receipts").insert({
+      task_id: id, agent_code: String(body.agent_code ?? data.claimed_by ?? "unknown"),
+      receipt_type: "TEXT_REPLACED", body: JSON.stringify(priorText),
+    }).then(() => {}, () => {});
+  }
   let receipt = null;
   if (body.receipt_type) {
     if (!AGENT_RECEIPT_TYPES.includes(body.receipt_type)) return c.json({ error: `receipt_type must be one of: ${AGENT_RECEIPT_TYPES.join(", ")}`, task: data }, 400, corsHeaders);
