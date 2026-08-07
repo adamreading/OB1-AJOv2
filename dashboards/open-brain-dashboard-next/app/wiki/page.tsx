@@ -49,7 +49,7 @@ interface WikiPageDetail extends WikiPageSummary {
 function formatDate(iso: string): string {
   if (!iso) return "";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
+    return new Date(iso).toLocaleDateString("en-GB", {
       year: "numeric",
       month: "short",
       day: "numeric",

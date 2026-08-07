@@ -381,7 +381,7 @@ export function EngineBoard() {
           {error
             ? `⚠ ${error}`
             : lastFetch
-              ? `refreshed ${lastFetch.toLocaleTimeString()} · auto 15s`
+              ? `refreshed ${lastFetch.toLocaleTimeString("en-GB")} · auto 15s`
               : "loading…"}
         </div>
       </div>

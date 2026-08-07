@@ -339,7 +339,7 @@ function SpeakersInner() {
       const k = dayKey(eff(r));
       const arr = byDay.get(k); if (arr) arr.push(r); else byDay.set(k, [r]);
     }
-    const fmtDay = (k: string) => new Date(k + "T00:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const fmtDay = (k: string) => new Date(k + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "2-digit", year: "numeric" });
     const newest = eff(sorted[0]); const oldest = eff(sorted[sorted.length - 1]);
     const spanDays = Math.round((newest.getTime() - oldest.getTime()) / 86400000);
     const drawEmpty = spanDays <= 92; // guard an absurdly long empty fill on the "all" view
@@ -704,7 +704,7 @@ function SpeakersInner() {
                     className={`w-full text-left px-3 py-2 text-sm border-b border-white/5 hover:bg-white/5 ${selectedId === row.r.recording_id ? "bg-white/10" : ""}`}>
                     <div className="truncate">{prettyTitle(row.r.title || row.r.recording_id)}</div>
                     <div className="text-xs opacity-50">
-                      {row.r.duration_ms ? fmtTime(row.r.duration_ms) : "—"} · {new Date(row.r.started_at ?? row.r.created_at).toLocaleDateString()}{row.r.started_at ? "" : " (ingest)"}
+                      {row.r.duration_ms ? fmtTime(row.r.duration_ms) : "—"} · {new Date(row.r.started_at ?? row.r.created_at).toLocaleDateString("en-GB")}{row.r.started_at ? "" : " (ingest)"}
                     </div>
                   </button>
                 </li>
