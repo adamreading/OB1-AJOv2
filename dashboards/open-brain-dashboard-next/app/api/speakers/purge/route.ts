@@ -18,10 +18,13 @@ export async function POST(request: NextRequest) {
   }
   const body = await request.json().catch(() => ({}));
   try {
+    // rest-api now requires confirm_token === review_status AND a max_delete ceiling
+    // (a partition holding 100% of the corpus made this a one-call corpus-zeroer). The
+    // dashboard clear is a deliberate window.confirm'd bulk action, so it forwards both.
     const res = await fetch(`${API_URL}/plaud-recordings/purge`, {
       method: "POST",
       headers: { "x-brain-key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ review_status: body.review_status }),
+      body: JSON.stringify({ review_status: body.review_status, confirm_token: body.confirm_token, max_delete: body.max_delete }),
     });
     const j = await res.json().catch(() => ({}));
     return NextResponse.json(j, { status: res.status });

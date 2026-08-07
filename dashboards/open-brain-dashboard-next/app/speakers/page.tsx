@@ -11,6 +11,9 @@ type RecordingSummary = {
   duration_ms: number | null;
   review_status: string;
   created_at: string;
+  // Present only on transcript-search results (GET /plaud-recordings?q=): the best-
+  // matching moment, so a result click can seek the audio straight to it.
+  match?: { idx: number; start_ms: number; speaker_key?: string; resolved_name?: string | null; snippet?: string | null; similarity?: number } | null;
 };
 type Speaker = {
   recording_id: string;
@@ -138,6 +141,15 @@ function SpeakersInner() {
   const [filter, setFilter] = useState<"pending" | "reviewed" | "all">("pending");
   const [refreshing, setRefreshing] = useState(false);
 
+  // Sort + transcript search + date grouping (m10). sortBy "date" uses started_at ??
+  // created_at. Search hits the rest-api pg_trgm endpoint; opening a result seeks the
+  // audio to the matched moment. searchResults===null ⇒ not in search mode (show list).
+  const [sortBy, setSortBy] = useState<"date" | "title">("date");
+  const [searchInput, setSearchInput] = useState("");
+  const [searchResults, setSearchResults] = useState<RecordingSummary[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const pendingSeek = useRef<{ rid: string; ms: number; idx: number } | null>(null);
+
   // Per-line transcript-text edit (pencil). editingText = idx being edited.
   const [editingText, setEditingText] = useState<number | null>(null);
   const [editTextValue, setEditTextValue] = useState("");
@@ -252,6 +264,34 @@ function SpeakersInner() {
     try { await loadRecordings(filter); } finally { setRefreshing(false); }
   }, [loadRecordings, filter]);
 
+  // Transcript search (m10) — hits GET /plaud-recordings?q= via the proxy. q_applied
+  // is checked so "searched, nothing matched" can't read as "search ignored".
+  const runSearch = useCallback(async () => {
+    const term = searchInput.trim();
+    if (!term) { setSearchResults(null); return; }
+    setSearching(true);
+    setStatus("");
+    try {
+      const res = await fetch(`/api/speakers?q=${encodeURIComponent(term)}`);
+      if (!res.ok) { setStatus(`Search failed (${res.status})`); setSearchResults([]); return; }
+      const j = await res.json();
+      if (j.q_applied === false) setStatus("Search was not applied by the server");
+      setSearchResults(j.recordings ?? []);
+    } catch (e) {
+      setStatus(`Search error (${e instanceof Error ? e.message : "network"})`);
+      setSearchResults([]);
+    } finally { setSearching(false); }
+  }, [searchInput]);
+
+  const clearSearch = useCallback(() => { setSearchInput(""); setSearchResults(null); }, []);
+
+  // Open a recording, optionally seeking to a transcript moment (search-result click).
+  const openRecording = useCallback((rid: string, seek?: { ms: number; idx: number }) => {
+    setSelectedId(rid);
+    pendingSeek.current = seek ? { rid, ms: seek.ms, idx: seek.idx } : null;
+    loadDetail(rid);
+  }, [loadDetail]);
+
   // Load enrolled voiceprint names for the rename typeahead when the modal opens
   // (autocomplete to an existing name → stops name/typo-style duplicate speakers).
   useEffect(() => {
@@ -261,6 +301,63 @@ function SpeakersInner() {
       .then((j) => setEnrolledNames(Array.isArray(j.speakers) ? j.speakers : []))
       .catch(() => setEnrolledNames([]));
   }, [renaming]);
+
+  // After a search-result open, seek the audio to the matched moment once the detail
+  // (and its <audio>) are mounted for the right recording.
+  useEffect(() => {
+    const ps = pendingSeek.current;
+    if (!ps || !detail || detail.recording.recording_id !== ps.rid) return;
+    pendingSeek.current = null;
+    const t = setTimeout(() => {
+      const a = audioRef.current;
+      if (a) { a.currentTime = ps.ms / 1000; a.play().catch(() => {}); }
+      setActiveIdx(ps.idx);
+    }, 150); // let the audio element mount + load metadata
+    return () => clearTimeout(t);
+  }, [detail]);
+
+  // Sort + per-day grouping for the recordings list. Effective date = started_at (the
+  // real record time, once the recording-time backfill lands) ?? created_at (ingest). Sorting by
+  // date DRAWS EMPTY DAYS across the span so a missing recording-day is VISIBLE — a plain
+  // sorted list reads as continuous and hides a gap (the "3–5 Aug vanished silently"
+  // incident; grouping alone is insufficient, the absent day has to render).
+  const listRows = useMemo(() => {
+    type Row = { kind: "header"; day: string; label: string; empty: boolean } | { kind: "rec"; r: RecordingSummary };
+    const rows: Row[] = [];
+    const eff = (r: RecordingSummary) => new Date(r.started_at ?? r.created_at);
+    if (sortBy === "title") {
+      [...recordings]
+        .sort((a, b) => prettyTitle(a.title || a.recording_id).localeCompare(prettyTitle(b.title || b.recording_id)))
+        .forEach((r) => rows.push({ kind: "rec", r }));
+      return rows;
+    }
+    const sorted = [...recordings].sort((a, b) => eff(b).getTime() - eff(a).getTime());
+    if (sorted.length === 0) return rows;
+    const dayKey = (d: Date) => d.toISOString().slice(0, 10);
+    const byDay = new Map<string, RecordingSummary[]>();
+    for (const r of sorted) {
+      const k = dayKey(eff(r));
+      const arr = byDay.get(k); if (arr) arr.push(r); else byDay.set(k, [r]);
+    }
+    const fmtDay = (k: string) => new Date(k + "T00:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const newest = eff(sorted[0]); const oldest = eff(sorted[sorted.length - 1]);
+    const spanDays = Math.round((newest.getTime() - oldest.getTime()) / 86400000);
+    const drawEmpty = spanDays <= 92; // guard an absurdly long empty fill on the "all" view
+    const cur = new Date(newest); cur.setUTCHours(0, 0, 0, 0);
+    const end = new Date(oldest); end.setUTCHours(0, 0, 0, 0);
+    while (cur.getTime() >= end.getTime()) {
+      const k = dayKey(cur);
+      const recs = byDay.get(k);
+      if (recs && recs.length) {
+        rows.push({ kind: "header", day: k, label: fmtDay(k), empty: false });
+        recs.forEach((r) => rows.push({ kind: "rec", r }));
+      } else if (drawEmpty) {
+        rows.push({ kind: "header", day: k, label: fmtDay(k), empty: true });
+      }
+      cur.setUTCDate(cur.getUTCDate() - 1);
+    }
+    return rows;
+  }, [recordings, sortBy]);
 
   // Stable "Speaker N" numbering from sorted distinct speaker keys.
   const speakerDisplay = useMemo(() => {
@@ -481,7 +578,10 @@ function SpeakersInner() {
     setPurging(true);
     setStatus(`Purging ${filter}…`);
     try {
-      const res = await fetch(`/api/speakers/purge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ review_status: status }) });
+      // confirm_token === review_status + a ceiling >= the count: this button is a
+      // deliberate, window.confirm'd bulk clear, so it satisfies the server's guard
+      // (which exists to stop an UNintended one-call corpus wipe by another caller).
+      const res = await fetch(`/api/speakers/purge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ review_status: status, confirm_token: status, max_delete: Math.max(n, 25) }) });
       if (res.ok) {
         const j = await res.json();
         setStatus(`Purged ${j.deleted ?? 0} recording(s)`);
@@ -501,7 +601,7 @@ function SpeakersInner() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold">
-            Speakers <span className="text-xs font-normal opacity-50">build m9 · {recordings.length} loaded</span>
+            Speakers <span className="text-xs font-normal opacity-50">build m10 · {recordings.length} loaded</span>
           </h1>
           <p className="text-sm opacity-60">Review transcripts, confirm who spoke, enrol voices into the library.</p>
         </div>
@@ -543,25 +643,74 @@ function SpeakersInner() {
                 </button>
               ))}
             </div>
+            {/* Transcript search + date/title sort (m10) */}
+            <div className="mt-2 flex items-center gap-1.5">
+              <input value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") clearSearch(); }}
+                placeholder="Search transcripts…"
+                className="flex-1 min-w-0 px-2 py-1 rounded bg-black/30 border border-white/15 text-xs outline-none focus:border-white/40" />
+              {searchResults !== null
+                ? <button onClick={clearSearch} title="Clear search" className="text-xs px-2 py-1 rounded border border-white/15 opacity-70 hover:opacity-100">✕</button>
+                : <button onClick={runSearch} disabled={searching || !searchInput.trim()} title="Search transcript text" className="text-xs px-2 py-1 rounded border border-white/15 opacity-70 hover:opacity-100 disabled:opacity-30">{searching ? "…" : "🔍"}</button>}
+            </div>
+            {searchResults === null && (
+              <div className="mt-1.5 flex items-center gap-1 text-[11px]">
+                <span className="opacity-40">sort</span>
+                {(["date", "title"] as const).map((s) => (
+                  <button key={s} onClick={() => setSortBy(s)}
+                    className={`px-1.5 py-0.5 rounded border ${sortBy === s ? "bg-white/15 border-white/30" : "border-white/10 opacity-50 hover:opacity-100"}`}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
             {/* Status/errors surfaced HERE so they're visible on the mobile list view
                 (the detail pane is hidden on mobile when nothing is selected). */}
             {status && <div className="text-xs mt-2 opacity-80 break-words">{status}</div>}
           </div>
           <ul className="max-h-[70vh] overflow-y-auto">
-            {recordings.map((r) => (
+            {/* SEARCH RESULTS — matching recordings + the matched moment (click seeks audio). */}
+            {searchResults !== null && searchResults.map((r) => (
               <li key={r.recording_id}>
                 <button
-                  onClick={() => { setSelectedId(r.recording_id); loadDetail(r.recording_id); }}
-                  className={`w-full text-left px-3 py-2 text-sm border-b border-white/5 hover:bg-white/5 ${selectedId === r.recording_id ? "bg-white/10" : ""}`}
-                >
+                  onClick={() => openRecording(r.recording_id, r.match ? { ms: r.match.start_ms, idx: r.match.idx } : undefined)}
+                  className={`w-full text-left px-3 py-2 text-sm border-b border-white/5 hover:bg-white/5 ${selectedId === r.recording_id ? "bg-white/10" : ""}`}>
                   <div className="truncate">{prettyTitle(r.title || r.recording_id)}</div>
-                  <div className="text-xs opacity-50">
-                    {r.duration_ms ? fmtTime(r.duration_ms) : "—"} · {new Date(r.created_at).toLocaleDateString()}
-                  </div>
+                  {r.match?.snippet && (
+                    <div className="text-xs opacity-70 mt-0.5 line-clamp-2">
+                      <span className="opacity-50">{fmtTime(r.match.start_ms)} · </span>{r.match.snippet}
+                    </div>
+                  )}
                 </button>
               </li>
             ))}
-            {recordings.length === 0 && <li className="px-3 py-4 text-sm opacity-50">No {filter === "all" ? "" : filter + " "}recordings.</li>}
+            {searchResults !== null && searchResults.length === 0 && (
+              <li className="px-3 py-4 text-sm opacity-50">No transcript matches for “{searchInput.trim()}”.</li>
+            )}
+
+            {/* NORMAL LIST — grouped by day when sorting by date; empty days are drawn so a
+                missing recording-day is visible (the incident fix). */}
+            {searchResults === null && listRows.map((row) =>
+              row.kind === "header" ? (
+                <li key={`h-${row.day}`}
+                  className={`px-3 py-1 text-[11px] uppercase tracking-wide border-b border-white/5 ${row.empty ? "opacity-30" : "opacity-55 bg-white/[0.03]"}`}>
+                  {row.label}{row.empty && <span className="ml-2 normal-case tracking-normal opacity-70">— no recordings —</span>}
+                </li>
+              ) : (
+                <li key={row.r.recording_id}>
+                  <button
+                    onClick={() => { setSelectedId(row.r.recording_id); loadDetail(row.r.recording_id); }}
+                    className={`w-full text-left px-3 py-2 text-sm border-b border-white/5 hover:bg-white/5 ${selectedId === row.r.recording_id ? "bg-white/10" : ""}`}>
+                    <div className="truncate">{prettyTitle(row.r.title || row.r.recording_id)}</div>
+                    <div className="text-xs opacity-50">
+                      {row.r.duration_ms ? fmtTime(row.r.duration_ms) : "—"} · {new Date(row.r.started_at ?? row.r.created_at).toLocaleDateString()}{row.r.started_at ? "" : " (ingest)"}
+                    </div>
+                  </button>
+                </li>
+              )
+            )}
+            {searchResults === null && recordings.length === 0 && <li className="px-3 py-4 text-sm opacity-50">No {filter === "all" ? "" : filter + " "}recordings.</li>}
           </ul>
         </div>
 

@@ -4508,6 +4508,20 @@ app.post("/plaud-recordings", async (c) => {
   if (!recordingId) return c.json({ error: "recording_id (string) is required" }, 400, corsHeaders);
   if (!Array.isArray(body.segments)) return c.json({ error: "segments (array) is required" }, 400, corsHeaders);
 
+  // Tombstoned-rejection guard: a recording the operator deleted must not silently re-ingest
+  // (a re-drain used to be accepted, undoing his curation). Loud: 409 + rejected_reason
+  // + deleted_at IN THE JSON BODY (an MCP client never sees response headers).
+  const { data: tomb } = await supabase.from("plaud_deleted_recordings")
+    .select("deleted_at").eq("recording_id", recordingId).maybeSingle();
+  if (tomb) {
+    return c.json({
+      error: "recording was deleted and is tombstoned; re-ingest refused",
+      rejected_reason: "tombstoned",
+      recording_id: recordingId,
+      deleted_at: (tomb as { deleted_at: string }).deleted_at,
+    }, 409, corsHeaders);
+  }
+
   const recRow: Record<string, unknown> = {
     recording_id: recordingId,
     title: typeof body.title === "string" ? body.title : null,
@@ -4523,13 +4537,6 @@ app.post("/plaud-recordings", async (c) => {
     metadata: (body.metadata && typeof body.metadata === "object") ? body.metadata : {},
     updated_at: new Date().toISOString(),
   };
-  const { error: recErr } = await supabase.from("plaud_recordings")
-    .upsert(recRow, { onConflict: "recording_id" });
-  if (recErr) return c.json({ error: recErr.message }, 500, corsHeaders);
-
-  // Replace segments + speakers for a clean re-ingest.
-  await supabase.from("plaud_speaker_segments").delete().eq("recording_id", recordingId);
-  await supabase.from("plaud_recording_speakers").delete().eq("recording_id", recordingId);
 
   const segRows = body.segments.map((s: Record<string, unknown>, i: number) => ({
     recording_id: recordingId,
@@ -4549,10 +4556,6 @@ app.post("/plaud-recordings", async (c) => {
     text_edited: s.text_edited === true,
     text: typeof s.text === "string" ? s.text : null,
   }));
-  if (segRows.length) {
-    const { error: segErr } = await supabase.from("plaud_speaker_segments").insert(segRows);
-    if (segErr) return c.json({ error: segErr.message }, 500, corsHeaders);
-  }
 
   // Speakers: use the provided list, else derive distinct keys from segments.
   let speakerRows: Record<string, unknown>[];
@@ -4578,25 +4581,71 @@ app.post("/plaud-recordings", async (c) => {
     }
     speakerRows = [...seen.values()];
   }
-  if (speakerRows.length) {
-    const { error: spErr } = await supabase.from("plaud_recording_speakers").insert(speakerRows);
-    if (spErr) return c.json({ error: spErr.message }, 500, corsHeaders);
-  }
 
-  return c.json({ recording_id: recordingId, segments: segRows.length, speakers: speakerRows.length }, 201, corsHeaders);
+  // ATOMIC replace: upsert recording + wholesale-replace segments/speakers in ONE
+  // transaction (plaud_ingest_replace). If any insert fails, the deletes roll back,
+  // so a mid-way error can no longer leave a recording with zero segments (the
+  // silent partial-wipe the old sequential delete-then-insert allowed).
+  const { data: ir, error: irErr } = await supabase.rpc("plaud_ingest_replace", {
+    p_recording: recRow, p_segments: segRows, p_speakers: speakerRows,
+  });
+  if (irErr) return c.json({ error: irErr.message }, 500, corsHeaders);
+  const irRow = (Array.isArray(ir) ? ir[0] : ir) as { segments?: number; speakers?: number } | null;
+  return c.json({
+    recording_id: recordingId,
+    segments: irRow?.segments ?? segRows.length,
+    speakers: irRow?.speakers ?? speakerRows.length,
+  }, 201, corsHeaders);
 });
 
 // LIST — for the /speakers GUI. Newest first; ?review_status= filters.
 app.get("/plaud-recordings", async (c) => {
-  const status = c.req.query("review_status");
+  // Accept review_status OR its common alias `status` (the latter was silently ignored).
+  const reviewStatus = c.req.query("review_status") ?? c.req.query("status");
+  const searchQ = (c.req.query("q") ?? "").trim();
+  const sort = c.req.query("sort");                 // started_at | title | (default) created_at
   const limit = Math.min(500, Math.max(1, Number(c.req.query("limit") ?? 100)));
-  let q = supabase.from("plaud_recordings")
-    .select("id, recording_id, title, started_at, duration_ms, audio_ref, review_status, created_at, updated_at")
-    .order("created_at", { ascending: false }).limit(limit);
-  if (status) q = q.eq("review_status", status);
-  const { data, error } = await q;
+
+  // Soft known-set for GET query params: do NOT hard-400 an unknown one (browsers/proxies
+  // append benign params) — echo ignored_params in the body so a typo'd param is VISIBLE,
+  // not a silent full-list. Complements q_applied (which covers param-honoured-but-no-match).
+  const KNOWN = new Set(["review_status", "status", "q", "limit", "sort"]);
+  const ignored = [...new URL(c.req.url).searchParams.keys()].filter((k) => !KNOWN.has(k));
+
+  // TRANSCRIPT SEARCH: q= runs a pg_trgm word_similarity search over segment text and
+  // returns matching recordings, each annotated with its best-matching moment (idx +
+  // start_ms + snippet) so the UI can deep-link INTO the moment. q_applied is ALWAYS in
+  // the body so "searched, nothing matched" can never read as "search ignored" (the
+  // 200-with-a-full-list footgun). Search is global — review_status is not applied here.
+  if (searchQ) {
+    const { data: hits, error: sErr } = await supabase.rpc("plaud_search_transcripts", { p_q: searchQ, p_limit: 500 });
+    if (sErr) return c.json({ error: sErr.message, q_applied: false, q_error: true }, 500, corsHeaders);
+    const byRec = new Map<string, Record<string, unknown>>();
+    for (const h of (hits ?? []) as Array<Record<string, unknown>>) {
+      const rid = h.recording_id as string;
+      const prev = byRec.get(rid);
+      if (!prev || Number(h.similarity) > Number(prev.similarity)) {
+        byRec.set(rid, {
+          recording_id: rid, title: h.title, started_at: h.started_at,
+          match: { idx: h.idx, start_ms: h.start_ms, speaker_key: h.speaker_key, resolved_name: h.resolved_name, snippet: h.snippet, similarity: h.similarity },
+          similarity: h.similarity,
+        });
+      }
+    }
+    const recordings = [...byRec.values()].sort((a, b) => Number(b.similarity) - Number(a.similarity)).slice(0, limit);
+    return c.json({ recordings, q_applied: true, q: searchQ, match_count: recordings.length, review_status_applied: null, ignored_params: ignored }, 200, corsHeaders);
+  }
+
+  let query = supabase.from("plaud_recordings")
+    .select("id, recording_id, title, started_at, duration_ms, audio_ref, review_status, created_at, updated_at");
+  if (sort === "started_at") query = query.order("started_at", { ascending: false, nullsFirst: false }).order("created_at", { ascending: false });
+  else if (sort === "title") query = query.order("title", { ascending: true, nullsFirst: false });
+  else query = query.order("created_at", { ascending: false });   // default UNCHANGED (non-breaking)
+  query = query.limit(limit);
+  if (reviewStatus) query = query.eq("review_status", reviewStatus);
+  const { data, error } = await query;
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  return c.json({ recordings: data ?? [] }, 200, corsHeaders);
+  return c.json({ recordings: data ?? [], q_applied: false, review_status_applied: reviewStatus ?? null, ignored_params: ignored }, 200, corsHeaders);
 });
 
 // DETAIL — recording + its speakers + ordered segments.
@@ -4624,10 +4673,10 @@ app.get("/plaud-recordings/:recording_id", async (c) => {
 app.patch("/plaud-recordings/:recording_id", async (c) => {
   const rid = c.req.param("recording_id");
   const body = await c.req.json().catch(() => ({}));
-  const ALLOWED = new Set(["review_status", "summary_md"]);
+  const ALLOWED = new Set(["review_status", "summary_md", "started_at"]);
   const unknown = Object.keys(body).filter((k) => !ALLOWED.has(k));
   if (unknown.length) {
-    return c.json({ error: `unrecognised field(s): ${unknown.join(", ")}. This endpoint accepts review_status and/or summary_md; per-segment edits (text/resolved_name/excluded/text_edited) go to PATCH /plaud-recordings/:recording_id/segments/:idx.` }, 400, corsHeaders);
+    return c.json({ error: `unrecognised field(s): ${unknown.join(", ")}. This endpoint accepts review_status, summary_md and/or started_at; per-segment edits (text/resolved_name/excluded/text_edited) go to PATCH /plaud-recordings/:recording_id/segments/:idx.` }, 400, corsHeaders);
   }
   const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if ("review_status" in body) {
@@ -4642,8 +4691,22 @@ app.patch("/plaud-recordings/:recording_id", async (c) => {
     }
     updates.summary_md = body.summary_md;
   }
+  // started_at backfill: ISO8601 string or null. typeof-string guard BEFORE Date.parse
+  // (Date.parse coerces via String(), so a one-element array would otherwise pass); store
+  // the NORMALIZED instant so Postgres never re-parses an ambiguous string under its own
+  // DateStyle. Column is timestamptz (verified live) so the Z offset is honoured.
+  if ("started_at" in body) {
+    const v = body.started_at;
+    if (v !== null && typeof v !== "string") {
+      return c.json({ error: "started_at must be an ISO8601 string or null" }, 400, corsHeaders);
+    }
+    if (v !== null && Number.isNaN(Date.parse(v))) {
+      return c.json({ error: "started_at must be an ISO8601 string or null" }, 400, corsHeaders);
+    }
+    updates.started_at = v === null ? null : new Date(v).toISOString();
+  }
   if (Object.keys(updates).length === 1) {  // only updated_at ⇒ nothing real supplied
-    return c.json({ error: "provide review_status and/or summary_md" }, 400, corsHeaders);
+    return c.json({ error: "provide review_status, summary_md and/or started_at" }, 400, corsHeaders);
   }
   const { data, error } = await supabase.from("plaud_recordings").update(updates).eq("recording_id", rid).select("*").maybeSingle();
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
@@ -4664,9 +4727,17 @@ app.delete("/plaud-recordings/:recording_id", async (c) => {
     .select("*", { count: "exact", head: true }).eq("recording_id", rid);
   const { count: spkCount } = await supabase.from("plaud_recording_speakers")
     .select("*", { count: "exact", head: true }).eq("recording_id", rid);
-  const { error } = await supabase.from("plaud_recordings").delete().eq("recording_id", rid);
+  // ATOMIC delete + tombstone (one data-modifying CTE): the tombstoned set == the
+  // deleted set by construction, so a deleted recording is always recorded and the
+  // ingress guard can refuse a re-drain. ON CONFLICT DO UPDATE so an un-delete→re-delete
+  // never unique_violations (which would roll the delete back = an undeletable row).
+  const { data: del, error } = await supabase.rpc("plaud_delete_recording", {
+    p_recording_id: rid, p_deleted_via: "single",
+  });
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  return c.json({ deleted: true, recording_id: rid, segments_deleted: segCount ?? 0, speakers_deleted: spkCount ?? 0 }, 200, corsHeaders);
+  const delRow = (Array.isArray(del) ? del[0] : del) as { deleted?: boolean } | null;
+  if (!delRow?.deleted) return c.json({ error: "recording not found" }, 404, corsHeaders);
+  return c.json({ deleted: true, tombstoned: true, recording_id: rid, segments_deleted: segCount ?? 0, speakers_deleted: spkCount ?? 0 }, 200, corsHeaders);
 });
 
 // BULK PURGE recordings by review_status — clear a stale backlog (e.g. wipe all
@@ -4681,14 +4752,41 @@ app.post("/plaud-recordings/purge", async (c) => {
   if (!ALLOWED.includes(status)) {
     return c.json({ error: `review_status is required and must be one of ${ALLOWED.join("|")} (no unfiltered purge)` }, 400, corsHeaders);
   }
-  const { data: rows, error: selErr } = await supabase.from("plaud_recordings")
-    .select("recording_id").eq("review_status", status);
-  if (selErr) return c.json({ error: selErr.message }, 500, corsHeaders);
-  const ids = (rows ?? []).map((r) => r.recording_id);
-  if (ids.length === 0) return c.json({ deleted: 0, recording_ids: [], review_status: status }, 200, corsHeaders);
-  const { error: delErr } = await supabase.from("plaud_recordings").delete().eq("review_status", status);
-  if (delErr) return c.json({ error: delErr.message }, 500, corsHeaders);
-  return c.json({ deleted: ids.length, recording_ids: ids, review_status: status }, 200, corsHeaders);
+  // SAFETY (a partition holding 100% of the corpus made this a one-call corpus-zeroer):
+  //  - confirm_token MUST equal review_status (explicit intent), AND
+  //  - the deleted count must not exceed max_delete (default 25) or the whole txn rolls
+  //    back and NOTHING is deleted. Both enforced INSIDE plaud_purge_recordings on the
+  //    RETURNING count (no client-side TOCTOU). To wipe a large partition on purpose,
+  //    pass an explicit max_delete >= its size AND confirm_token = the review_status.
+  const maxDelete = Number.isFinite(Number(body.max_delete)) ? Number(body.max_delete) : 25;
+  const { data: pg, error } = await supabase.rpc("plaud_purge_recordings", {
+    p_review_status: status, p_max_delete: maxDelete, p_confirm_token: body.confirm_token ?? null,
+  });
+  if (error) {
+    const msg = error.message || "";
+    if (msg.includes("confirm_token")) {
+      return c.json({ error: `confirm_token must equal review_status ('${status}') to purge`, rejected_reason: "confirm_token_required" }, 400, corsHeaders);
+    }
+    if (msg.includes("ceiling")) {
+      return c.json({ error: msg, rejected_reason: "ceiling_exceeded", max_delete: maxDelete, hint: "pass an explicit max_delete >= the partition size to purge it on purpose" }, 409, corsHeaders);
+    }
+    return c.json({ error: msg }, 500, corsHeaders);
+  }
+  const pgRow = (Array.isArray(pg) ? pg[0] : pg) as { deleted?: number; recording_ids?: string[] } | null;
+  return c.json({ deleted: pgRow?.deleted ?? 0, recording_ids: pgRow?.recording_ids ?? [], review_status: status, tombstoned: true }, 200, corsHeaders);
+});
+
+// UN-DELETE — clear a recording's tombstone so a re-drain may repopulate it. The
+// original DELETE was hard + FK cascade, so segments/speakers are already GONE; this
+// does NOT restore data, it lifts the ingress refusal so the WSL pipeline can re-push
+// (the intended recovery path from a mis-delete: undelete, then re-drain).
+app.post("/plaud-recordings/:recording_id/undelete", async (c) => {
+  const rid = c.req.param("recording_id");
+  const { data, error } = await supabase.from("plaud_deleted_recordings")
+    .delete().eq("recording_id", rid).select("recording_id").maybeSingle();
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!data) return c.json({ error: "no tombstone for that recording_id", recording_id: rid }, 404, corsHeaders);
+  return c.json({ undeleted: true, recording_id: rid, note: "tombstone cleared; a re-drain will now be accepted (data itself is not restored)" }, 200, corsHeaders);
 });
 
 // PATCH ONE segment: rename "just this instance" (diarization slip fix), set the

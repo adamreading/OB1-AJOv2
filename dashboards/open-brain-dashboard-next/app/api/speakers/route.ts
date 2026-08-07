@@ -13,9 +13,14 @@ export async function GET(request: NextRequest) {
     if (err instanceof AuthError) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     throw err;
   }
-  const status = request.nextUrl.searchParams.get("review_status");
+  const qp = request.nextUrl.searchParams;
+  const status = qp.get("review_status");
+  const q = qp.get("q");
+  const sort = qp.get("sort");
   const sp = new URLSearchParams();
   if (status) sp.set("review_status", status);
+  if (q) sp.set("q", q);          // transcript search (rest-api runs pg_trgm over segments)
+  if (sort) sp.set("sort", sort); // date | title (default created_at)
   try {
     const res = await fetch(`${API_URL}/plaud-recordings?${sp}`, {
       headers: { "x-brain-key": apiKey },
