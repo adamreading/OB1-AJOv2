@@ -1143,6 +1143,53 @@ app.post("/capture-pending", async (c) => {
 
   if (resolvedClassification) meta.classification = resolvedClassification;
 
+  // One-open-UPDATE-vessel-per-target (2026-08-19). /capture-pending had NO dedup on
+  // update_target_id, so N drains of one target minted N pending vessels sharing a
+  // byte-identical original_content BASE; the first approval then made the siblings stale
+  // and the stale-guard escalated them (the 11 "manufactured collisions", targets 6402/6442).
+  // A true FOLD of two independent merges is itself a model call -> cannot live in the edge
+  // fn (same reason the re-snapshot idea was withdrawn: a vessel body is a full merged
+  // REPLACEMENT vs original_content, not a diff). So enforce the invariant AT CAPTURE:
+  //   same base   -> REPLACE the open vessel in place (a fresher merge of the SAME base;
+  //                  no intervening change to lose).
+  //   diverged /  -> REJECT 409 with a pointer (a genuine intervening change, or a base we
+  //   unconfirmable  can't confirm; must NOT silently overwrite -- the #426 case the
+  //                  stale-guard exists for -- nor mint another colliding sibling).
+  // Governs NEW captures only; pre-existing legacy dups are the curator's to reconcile, not touched here.
+  if (update_target_id != null) {
+    const { data: openVessels } = await supabase
+      .from("thoughts")
+      .select("serial_id, metadata")
+      .eq("metadata->>review_status", "pending_review")
+      .eq("metadata->>update_target_id", String(update_target_id))
+      .order("serial_id", { ascending: false });
+    const openVessel = openVessels?.[0];
+    if (openVessel) {
+      const existingBase = (openVessel.metadata as Record<string, unknown> | null)?.original_content ?? null;
+      const sameBase = existingBase != null && original_content != null && existingBase === original_content;
+      if (sameBase) {
+        const { data: replaced, error: repErr } = await supabase
+          .from("thoughts")
+          .update({ content: trimmed, content_fingerprint: fp, metadata: meta })
+          .eq("serial_id", openVessel.serial_id)
+          .select("serial_id")
+          .single();
+        if (repErr) return c.json({ error: repErr.message }, 500);
+        return c.json({
+          thought_id: replaced.serial_id,
+          action: "replaced",
+          message: "Folded into the existing pending update vessel (same base)",
+        }, 200, corsHeaders);
+      }
+      return c.json({
+        action: "conflict",
+        existing_vessel_id: openVessel.serial_id,
+        update_target_id,
+        message: "A pending update vessel already exists for this target; resolve it before adding another (base differs or is unconfirmable).",
+      }, 409, corsHeaders);
+    }
+  }
+
   const { data: inserted, error } = await supabase
     .from("thoughts")
     .insert({
